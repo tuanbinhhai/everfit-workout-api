@@ -303,8 +303,10 @@ This section will keep growing as later implementation steps land.
 
 ## Session Handoff
 
-**Date / session:** 2026-09-15. Session 1: Phases 1–4 planning + Steps 0–2. Session 2 (same day,
-continuation): Steps 3–4. Session 3 (this update, same day, continuation): Steps 5–7.
+**Date / session:** 2026-09-15, end-of-day closeout. Session 1: Phases 1–4 planning + Steps 0–2.
+Session 2 (same day, continuation): Steps 3–4. Session 3 (same day, continuation): Steps 5–7.
+This update is the end-of-day handoff after Session 3 — no code changed since the Step 5-7
+report; this section only confirms final state and records the closeout itself.
 
 **Completed implementation steps** (of `docs/IMPLEMENTATION_PLAN.md`'s 15 steps):
 - Step 0 — NestJS bootstrap + tooling. Commit `4bb235b`.
@@ -365,11 +367,13 @@ entries/sets from manual Docker verification (harmless leftover test data — `d
 ids in the 90s — not cleaned up since the volume is dev-only and gets reset via
 `docker compose down -v` if ever needed; documented here rather than silently left unexplained).
 
-**Latest commit:** `5fedf19` — `feat: implement atomic workout logging with tests` (this
-`AI_WORKFLOW.md` update itself will be committed immediately after being written).
+**Latest commit:** `d110c96` — `docs: record Step 5-7 AI interactions and session handoff in
+AI_WORKFLOW.md` (the code itself last changed at `5fedf19`). This end-of-day update will be its
+own commit on top, per usual practice — this file is maintained continuously, not backfilled.
 
-**Working tree status:** Clean as of the last code commit; only this `AI_WORKFLOW.md` update
-pending, committed right after this section is written.
+**Working tree status:** Clean — `git status` reports nothing to commit prior to this update;
+verified directly, not assumed. No Docker containers running (`docker compose ps` empty); the
+Postgres data volume is preserved for the next session.
 
 **Known issues:** Same as previous checkpoints (transitive `npm audit` advisories in unreachable
 code paths; host port 5432→5433 remap, permanent and documented) — nothing new introduced by
@@ -377,6 +381,14 @@ Steps 5–7. Leftover manual-verification rows in the dev Postgres volume (see D
 above) — cosmetic, not a defect.
 
 **Unresolved decisions:** None blocking.
+
+**Outstanding assignment requirement:** per explicit instruction this session, the genuine
+rejected-AI-suggestion requirement is being treated as **still pending**, even though a "Rejected
+AI suggestion (real)" section already exists above (the NestJS CLI scaffold's Vitest/oxlint
+defaults, self-corrected during Step 0). That entry stays in the file as a real, accurate record
+of what happened, but nothing further is being invented to additionally satisfy this requirement.
+If a genuine rejection happens in a later step — the human directing a change away from something
+proposed during this collaboration — it will be recorded then, truthfully, not before.
 
 **Architecture deviations:**
 1. (Carried forward, unchanged) Step 4's `UnitConversionService` uses a flat conversion-factor
