@@ -4,6 +4,7 @@ node_modules/
 # build output
 dist/
 coverage/
+tsconfig.build.tsbuildinfo
 
 # environment
 .env
@@ -16,8 +17,9 @@ npm-debug.log*
 # OS
 .DS_Store
 
-# Prisma
+# Prisma (generated client — regenerated via `prisma generate` / npm postinstall)
 prisma/*.db
+src/generated/
 
 # IDE
 .vscode/

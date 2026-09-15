@@ -7,7 +7,10 @@ services:
       POSTGRES_PASSWORD: workout
       POSTGRES_DB: workout_api
     ports:
-      - '5432:5432'
+      # Host port 5433 -> container 5432, to avoid colliding with a locally
+      # installed Postgres that may already be listening on the host's 5432.
+      # Container-to-container traffic (api -> postgres:5432) is unaffected.
+      - '5433:5432'
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:

@@ -1,0 +1,55 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+/// One exercise logged on one calendar date. See docs/ARCHITECTURE.md §4.
+model WorkoutEntry {
+  id                      BigInt   @id @default(autoincrement())
+  userId                  String   @map("user_id")
+  exerciseName            String   @map("exercise_name")
+  exerciseNameNormalized  String   @map("exercise_name_normalized")
+  /// Business calendar date — never converted through UTC. See docs/CLARIFICATIONS.md §2/§3.
+  date                    DateTime @db.Date
+  createdAt               DateTime @default(now()) @db.Timestamptz @map("created_at")
+  updatedAt               DateTime @updatedAt @db.Timestamptz @map("updated_at")
+
+  sets WorkoutSet[]
+
+  @@index([userId, date(sort: Desc), id(sort: Desc)], name: "idx_entries_user_date")
+  @@index([userId, exerciseNameNormalized, date(sort: Desc), id(sort: Desc)], name: "idx_entries_user_exercise_date")
+  @@map("workout_entries")
+}
+
+/// One set within a WorkoutEntry. See docs/ARCHITECTURE.md §4.
+model WorkoutSet {
+  id              BigInt   @id @default(autoincrement())
+  workoutEntryId  BigInt   @map("workout_entry_id")
+  /// 0-based position within the entry, for stable display order.
+  setIndex        Int      @map("set_index")
+  reps            Int
+  /// Original value as entered, in the original unit.
+  weight          Decimal  @db.Decimal(10, 4)
+  unit            String
+  /// Normalized value in kg, full precision — never pre-rounded. See docs/CLARIFICATIONS.md §11.
+  weightKg        Decimal  @db.Decimal(10, 4) @map("weight_kg")
+  createdAt       DateTime @default(now()) @db.Timestamptz @map("created_at")
+
+  entry WorkoutEntry @relation(fields: [workoutEntryId], references: [id], onDelete: Cascade)
+
+  @@unique([workoutEntryId, setIndex], map: "uq_sets_entry_set_index")
+  @@index([workoutEntryId], name: "idx_sets_entry")
+  @@map("workout_sets")
+}
+
+/// Configurable exercise -> muscle group mapping, independent of workout data. See docs/ARCHITECTURE.md §11.
+model ExerciseMuscleGroup {
+  exerciseNameNormalized String @id @map("exercise_name_normalized")
+  muscleGroup             String @map("muscle_group")
+
+  @@map("exercise_muscle_groups")
+}
