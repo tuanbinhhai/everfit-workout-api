@@ -58,6 +58,9 @@ correction happens inline, in conversation, before code is accepted.
 | 7 | Step 2 — Prisma schema/migration | Wrote `prisma/schema.prisma` matching ARCHITECTURE.md §4.2, ran `prisma migrate dev --create-only`, hand-edited the generated SQL for CHECK constraints + trigram index, applied it, wrote a real-Postgres integration test | Prisma 7's `migrate` rejected a `url` in the schema datasource block; `@@unique(..., name:)` silently didn't set the DB constraint name; Docker build produced a container with a corrupted, partial `dist/` | All three investigated and root-caused for real (not guessed) — see "AI mistakes" below | Fixed; `npm run test:integration` 3/3, `docker compose up --build` verified end-to-end |
 | 8 | Step 3 — exercise metadata provider | Given explicit instructions to keep it to an interface + token + one Prisma-backed implementation + a small seed script, no extra abstraction | `MuscleGroupProvider` interface/token, `PrismaMuscleGroupProvider`, `prisma/seed.ts` (7-exercise demo set), shared `normalizeExerciseName` helper | Matched the requested shape directly; no corrections needed | Committed (`f109358`); unit tests 5/5, seed script run twice against real Postgres to confirm idempotency (stayed at 7 rows) |
 | 9 | Step 4 — unit conversion | Given explicit instruction to prefer a small conversion-factor registry over a converter-class-per-unit hierarchy | `Record<string, number>` factor table + `toKg`/`fromKg`/`isSupported`, typed `UnsupportedUnitError` | Matched the requested shape; deliberately simpler than this file's own earlier "UnitConverter interface + per-unit classes" description in `docs/ARCHITECTURE.md` §12 — the instruction to simplify is followed, not the earlier doc wording, since the human's explicit in-session direction takes precedence | Committed (`7b6484f`); unit tests 8/8 incl. a precision case that would fail under premature 2dp rounding |
+| 10 | Step 5 — structured error handling | Exact response shape specified; asked to centralize mapping, not scatter try/catch | `GlobalExceptionFilter` (`@Catch()` on everything) + a custom `ValidationPipe.exceptionFactory` flattening nested `ValidationError[]` into the same `details[]` shape | Matched the requested shape; extracted a shared `configureApp()` so e2e tests exercise the identical pipe/filter setup as `main.ts` rather than risking drift between prod and test | Committed (`05a8cbb`); filter unit tests 6/6, incl. one asserting 500s are logged and 400s are not |
+| 11 | Step 6 — workout DTOs | Explicit requirement: reject impossible dates, not just regex-shaped ones; keep unit-support checking out of DTOs | `IsCalendarDate` custom validator (regex + `Date.UTC` round-trip to catch e.g. `2026-02-30`), `exerciseName` trimmed via `class-transformer` before `@IsNotEmpty()` | Matched the requested shape directly | Committed (`05a8cbb`) |
+| 12 | Step 7 — POST /workouts | Explicit repository responsibility split (batch inserts, one transaction, no business logic) | `createManyAndReturn` for both entries and sets (real multi-row `INSERT...RETURNING`, not N individual inserts), transaction rollback verified against real Postgres | Matched the requested shape; caught and fixed my own test-expectation bug (see "AI mistakes" below) via the integration run, not code review alone | Committed (`5fedf19`); 47 unit / 10 integration / 23 e2e, Docker-verified with real curl + psql |
 
 ---
 
@@ -188,6 +191,22 @@ host-environment-specific state that silently corrupts a "works on my machine" b
 into a container with different absolute paths. Verify by inspecting the actual running
 container/image, not by reading the build log for the word "error."
 
+### Minor, for completeness: a wrong test expectation (not application code), caught by actually running it
+
+Not counted as one of the two required examples above (those are substantive; this is a one-line
+test typo), but recorded here rather than silently fixed, per this file's own "never fabricate,
+never silently fix" policy. In the Step 7 integration test for storing lb→kg conversions, I wrote
+`expect(Number(set.weightKg)).toBeCloseTo(99.7903214, 6)` — 7 decimal digits of expected
+precision. Running `npm run test:integration` against real Postgres failed: the actual stored
+value was `99.7903` (4 decimal places), because the `weight_kg` column is `NUMERIC(10,4)` by
+design (`docs/ARCHITECTURE.md` §4.2) — the database itself rounds to 4dp on storage, which is
+correct, expected behavior, not a bug. My test's expected value assumed more precision than the
+schema actually stores. Fixed the test's expectation (`toBeCloseTo(99.7903, 4)`), not the code.
+**What was learned:** when asserting on a `NUMERIC(n, scale)` column's stored value, the
+expectation needs to match the column's declared scale, not the full-precision value computed
+before storage — an easy thing to get wrong when the conversion math and the storage precision
+are defined in different places.
+
 ---
 
 ## Rejected AI suggestion (real)
@@ -259,6 +278,24 @@ What was personally verified in this session, not just generated and trusted:
   the new seed data since integration tests only clean up `workout_entries`/`workout_sets`),
   `npm run test:e2e` (1/1, which also exercises the full `AppModule` bootstrap including the two
   newly-wired modules), `npm run lint`, `npx nest build`, `npx prettier --check`.
+- **Step 5-7 commands actually executed**: full sweep after implementation —
+  `npm test` (47/47), `npm run test:integration` (10/10, real Postgres), `npm run test:e2e`
+  (23/23, real Postgres via the full HTTP stack), `npm run lint` (0 errors/0 warnings — the 3
+  pre-existing warnings flagged at the last checkpoint were fixed, see below), `npx nest build`,
+  `npx prettier --check`, and a full `docker compose up -d --build` re-verification: real `curl`
+  requests for `GET /health`, a valid bulk `POST /workouts` (kg + lb in one request), an invalid
+  `POST /workouts` (impossible date → 400), and a two-exercise bulk request — every result
+  cross-checked against the actual rows in Postgres via `psql`, not just the HTTP response body.
+- **Lint warnings resolved, not just noted**: the 3 warnings flagged at the previous checkpoint
+  (2× `prisma as any` in a test mock, 1× `app.getHttpServer()` typed `any` in the e2e boilerplate)
+  were fixed by typing the mock/test helpers properly (`as unknown as PrismaService`, a typed
+  `httpServer: Server` variable) rather than suppressed or ignored — `npm run lint` is 0
+  errors/0 warnings as of this checkpoint.
+- **Transaction atomicity verified against a real database, not assumed from reading the code**:
+  the integration suite deliberately sends a payload with a duplicate `setIndex` (violating
+  `UNIQUE(workout_entry_id, set_index)`) partway through a multi-set entry, and asserts the
+  **entire** transaction — including the already-processed valid set and the entry row itself —
+  rolls back, by checking real row counts before and after.
 
 This section will keep growing as later implementation steps land.
 
@@ -266,86 +303,102 @@ This section will keep growing as later implementation steps land.
 
 ## Session Handoff
 
-**Date / session:** 2026-09-15. Session 1 covered Phases 1–4 planning + Steps 0–2. This update
-covers Steps 3–4, completed later the same day (continuation session).
+**Date / session:** 2026-09-15. Session 1: Phases 1–4 planning + Steps 0–2. Session 2 (same day,
+continuation): Steps 3–4. Session 3 (this update, same day, continuation): Steps 5–7.
 
 **Completed implementation steps** (of `docs/IMPLEMENTATION_PLAN.md`'s 15 steps):
 - Step 0 — NestJS bootstrap + tooling. Commit `4bb235b`.
 - Step 1 — Docker Compose dev environment. Commit `2ed9e70`.
 - Step 2 — Database schema + Prisma migration. Commit `09349ce`.
-- Step 3 — Configurable exercise → muscle group provider (`MuscleGroupProvider` interface/token,
-  `PrismaMuscleGroupProvider`, `prisma/seed.ts` with a 7-exercise demo set, shared
-  `normalizeExerciseName` helper). Commit `f109358`.
-- Step 4 — Extensible unit conversion (`UnitConversionService` with a `Record<string, number>`
-  conversion-factor registry — deliberately simplified from a converter-class-per-unit hierarchy
-  per explicit instruction — plus `UnsupportedUnitError`). Also wires both new modules into
-  `AppModule`. Commit `7b6484f`.
+- Step 3 — Configurable exercise → muscle group provider. Commit `f109358`.
+- Step 4 — Extensible unit conversion. Commit `7b6484f`.
+- Step 5 — Structured error handling: `GlobalExceptionFilter` (catches everything, maps
+  `UnsupportedUnitError`/`HttpException`/unknown errors to one consistent shape, logs 500s
+  server-side without leaking internals to the client) + a `ValidationPipe.exceptionFactory` that
+  flattens class-validator's nested `ValidationError[]` into the same `details[]` shape. Shared
+  `configureApp()` so e2e tests use the identical pipe/filter setup as production. Commit
+  `05a8cbb` (bundled with Step 6).
+- Step 6 — Workout DTOs: `BulkCreateWorkoutDto` → `CreateWorkoutEntryDto[]` → `CreateWorkoutSetDto[]`,
+  a custom `IsCalendarDate` validator (rejects ISO datetimes and impossible dates via a `Date`
+  round-trip check), `exerciseName` trimmed before validation. DTOs validate shape only; unit
+  support-checking stays in `UnitConversionService`. Commit `05a8cbb`.
+- Step 7 — `POST /workouts`: `WorkoutsController` → `WorkoutsService` (normalize, convert to kg,
+  assign `setIndex`) → `WorkoutsRepository` (one Prisma transaction, `createManyAndReturn` for
+  true multi-row batch inserts of both entries and sets). All-or-nothing bulk semantics verified
+  against real Postgres, not assumed. Commit `5fedf19`.
 
-Plus the Phase 1–4 planning docs — commits `b673004`, `eb6e761`, and the Step 2 handoff update
-`344d989`.
+Plus Phase 1–4 planning docs (`b673004`) and the two prior `AI_WORKFLOW.md` handoff updates
+(`eb6e761`, `344d989`, `0f2ef49`).
 
-**Current implementation state:** Steps 0–4 fully implemented and verified for real. Step 5
-(global error handling + DTO validation scaffolding) has **not** been started.
+**Current implementation state:** Steps 0–7 fully implemented and verified for real. Step 8
+(workout history: `GET /workouts` with filtering, unit conversion, cursor pagination) has **not**
+been started.
 
 **Tests currently passing/failing:**
-- Unit (`npm test`): **19/19 passing** — first real unit-test suites in the project:
-  `normalize-exercise-name.spec.ts` (4), `prisma-muscle-group.provider.spec.ts` (5),
-  `unit-conversion.service.spec.ts` (10). "No tests found" is no longer an acceptable/expected
-  state from this checkpoint forward, and it no longer occurs.
-- Integration (`npm run test:integration`): **3/3 passing** (unchanged from Step 2 — Prisma
-  round-trip, `UNIQUE` rejection, `CHECK(reps>=1)` rejection; new seed data doesn't interfere
-  since these tests only clean up `workout_entries`/`workout_sets`).
-- E2E (`npm run test:e2e`): **1/1 passing** (`GET /health` → 200) — this also exercises full
-  `AppModule` bootstrap including the two newly-wired modules, so DI wiring is confirmed correct.
+- Unit (`npm test`): **47/47 passing.** Includes the first `WorkoutsService` unit tests (mocked
+  repository, no DB) and the `GlobalExceptionFilter`/`formatValidationErrors`/`IsCalendarDate`
+  suites new this checkpoint.
+- Integration (`npm run test:integration`, real Postgres): **10/10 passing** — 3 from Step 2
+  (Prisma wiring/constraints) + 7 new `WorkoutsRepository` tests (single/multi entry persistence,
+  weight/unit/weightKg storage, setIndex ordering, per-entry set attribution, transaction rollback
+  on a UNIQUE violation, CHECK(reps>=1) enforced even bypassing the DTO layer).
+- E2E (`npm run test:e2e`, real Postgres via full HTTP stack): **23/23 passing** — 1 health check
+  + 22 `POST /workouts` tests (5 happy paths, 16 validation/error paths, 1 concurrency smoke test).
 
-**Build/lint status:**
+**Build/lint/format status:**
 - `npm run build`: clean, `dist/main.js` at the correct path.
-- `npm run lint`: 0 errors, 3 warnings (the 1 pre-existing Supertest typing warning, plus 2 new
-  ones in `prisma-muscle-group.provider.spec.ts` from `prisma as any` in the mock setup — expected
-  for a lightweight hand-rolled mock, not a real issue).
+- `npm run lint`: **0 errors, 0 warnings** — the 3 warnings flagged at the last checkpoint (2×
+  `prisma as any` in a test mock, 1× `app.getHttpServer()` typed `any`) were fixed this session by
+  typing the mocks/helpers properly, not suppressed.
 - `npx prettier --check`: clean.
 
-**Docker status: NOT re-verified this checkpoint.** Per explicit instruction, a full
-`docker compose up --build` was not required unless Steps 3–4 changed something affecting
-container behavior. They added application code (new Nest modules, a seed script) but no
-Dockerfile/compose changes, and the e2e suite already boots the full `AppModule` including both
-new modules successfully — treated as sufficient proxy confidence, but a full container rebuild
-has **not** been run since the Step 2 verification. Flagging this honestly as unverified-this-
-round rather than assumed fine.
+**Docker status:** Re-verified end-to-end this checkpoint (Step 7 changes real runtime
+behavior, so this was required, not optional). `docker compose up -d --build` → real `curl`
+requests against the running container for `GET /health`, a valid bulk `POST /workouts` (kg + lb
+in one request), an invalid `POST /workouts` (impossible date → 400, confirmed nothing
+persisted), and a two-exercise bulk `POST /workouts` — every result cross-checked against the
+actual rows in Postgres via `psql`, not just the HTTP response body. Stack torn down
+(`docker compose down`) at the end of the checkpoint; volume preserved.
 
-**Database status:** Same Postgres container/volume as Step 2, now additionally seeded via
-`npm run prisma:seed` — verified by running it **twice** and checking row count via `psql`
-directly (stayed at 7 rows, confirming the upsert-based seed is idempotent). Postgres was stopped
-(`docker compose down`) at the end of this checkpoint; volume preserved.
+**Database status:** Same Postgres volume as previous checkpoints, now also containing workout
+entries/sets from manual Docker verification (harmless leftover test data — `docker-user` rows,
+ids in the 90s — not cleaned up since the volume is dev-only and gets reset via
+`docker compose down -v` if ever needed; documented here rather than silently left unexplained).
 
-**Latest commit:** `7b6484f` — `feat: add extensible unit conversion with unit tests`.
+**Latest commit:** `5fedf19` — `feat: implement atomic workout logging with tests` (this
+`AI_WORKFLOW.md` update itself will be committed immediately after being written).
 
-**Working tree status:** Clean as of this commit; this `AI_WORKFLOW.md` update will be committed
-immediately after being written.
+**Working tree status:** Clean as of the last code commit; only this `AI_WORKFLOW.md` update
+pending, committed right after this section is written.
 
-**Known issues:** Same as recorded after Step 2 (transitive `npm audit` advisories in
-unreachable code paths; host port 5432 collision with a pre-existing native Postgres, permanently
-resolved via host port 5433) — nothing new introduced by Steps 3–4.
+**Known issues:** Same as previous checkpoints (transitive `npm audit` advisories in unreachable
+code paths; host port 5432→5433 remap, permanent and documented) — nothing new introduced by
+Steps 5–7. Leftover manual-verification rows in the dev Postgres volume (see Database status
+above) — cosmetic, not a defect.
 
 **Unresolved decisions:** None blocking.
 
-**Architecture deviations:** One, explicitly instructed rather than discovered: Step 4's
-`UnitConversionService` uses a single conversion-factor registry (`Record<string, number>`)
-instead of the `UnitConverter` interface + per-unit converter classes described in
-`docs/ARCHITECTURE.md` §12. This was a direct, explicit instruction ("avoid unnecessary factories
-or strategy hierarchies if a small converter registry provides the required extensibility"), not
-an AI judgment call — noted here so `ARCHITECTURE.md` §12 can be reconciled with the simpler
-actual implementation when docs are next synchronized (e.g. at the README step), rather than
-leaving the two silently inconsistent.
+**Architecture deviations:**
+1. (Carried forward, unchanged) Step 4's `UnitConversionService` uses a flat conversion-factor
+   registry instead of `ARCHITECTURE.md` §12's per-unit-converter-class description — explicitly
+   instructed, to be reconciled when docs are next synchronized.
+2. (New, also explicitly instructed) The `POST /workouts` response returns the full created
+   entries+sets (id, userId, exerciseName, date, and each set's id/setIndex/reps/weight/unit/
+   weightKg) rather than just ids — `ARCHITECTURE.md` didn't specify an exact response shape for
+   this endpoint, so this was a reasonable, explainable choice made during implementation, not a
+   deviation from a documented decision. Noted here for README/API-docs consistency at Step 13.
 
-**Exact next implementation step:** `docs/IMPLEMENTATION_PLAN.md` **Step 5 — Global error
-handling + DTO validation scaffolding**:
-- `src/common/filters/global-exception.filter.ts`
-- A `DomainError` base class (or direct handling of `UnsupportedUnitError` and future domain
-  errors) mapped to the structured error shape from `docs/CLARIFICATIONS.md` §18
-- `ValidationPipe` configuration in `main.ts`
-- Unit test for the filter directly (given a thrown error, assert the shaped response body)
+**Exact next implementation step:** `docs/IMPLEMENTATION_PLAN.md` **Step 8 — Workout history
+(`GET /workouts`)**:
+- `history-query.dto.ts` (userId, optional exerciseName/from/to/muscleGroup/unit/cursor/limit)
+- Repository method for keyset-paginated, filtered history (base index vs. exercise-filtered
+  index per `ARCHITECTURE.md` §7/§8; partial-match search via the trigram index — real usage of
+  the `idx_entries_exercise_trgm` index created in Step 2 but never yet exercised by any query)
+- Service-layer unit conversion of returned weights to the requested display unit
+- Empty-result shape with a message, per `docs/CLARIFICATIONS.md` #17
 
-**Files/modules likely to be touched next:** `src/common/filters/`, `src/main.ts`, and probably a
-first look at how `UnsupportedUnitError` (already thrown by `UnitConversionService`) should map
-through this filter, since that's the first real domain error in the codebase.
+**Files/modules likely to be touched next:** `src/workouts/dto/history-query.dto.ts`,
+`workouts.repository.ts` (new read method, first real use of raw/`$queryRaw`-style Prisma access
+for keyset pagination per `ARCHITECTURE.md` §8), `workouts.service.ts`, `workouts.controller.ts`
+(new `GET /workouts` route), and the `ExerciseMetadataModule`'s `MuscleGroupProvider` gets its
+first real caller (muscle-group filtering) via `WorkoutsModule` importing `ExerciseMetadataModule`.
