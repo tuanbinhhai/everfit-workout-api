@@ -1,0 +1,38 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: workout
+      POSTGRES_PASSWORD: workout
+      POSTGRES_DB: workout_api
+    ports:
+      - '5432:5432'
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U workout -d workout_api']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      PORT: 3000
+      LOG_LEVEL: info
+      DATABASE_URL: postgresql://workout:workout@postgres:5432/workout_api?schema=public
+      DEFAULT_PAGE_SIZE: 20
+      MAX_PAGE_SIZE: 100
+      MAX_BULK_ENTRIES: 100
+    ports:
+      - '3000:3000'
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
