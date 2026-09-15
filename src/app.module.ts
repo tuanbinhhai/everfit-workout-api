@@ -6,6 +6,7 @@ import { ExerciseMetadataModule } from './exercise-metadata/exercise-metadata.mo
 import { HealthModule } from './health/health.module';
 import { PrismaModule } from './prisma/prisma.module';
 import { UnitConversionModule } from './unit-conversion/unit-conversion.module';
+import { WorkoutsModule } from './workouts/workouts.module';
 
 @Module({
   imports: [
@@ -17,6 +18,7 @@ import { UnitConversionModule } from './unit-conversion/unit-conversion.module';
     PrismaModule,
     ExerciseMetadataModule,
     UnitConversionModule,
+    WorkoutsModule,
     HealthModule,
   ],
 })
