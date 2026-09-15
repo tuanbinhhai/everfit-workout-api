@@ -1,11 +1,12 @@
+import { PrismaService } from '../prisma/prisma.service';
 import { PrismaMuscleGroupProvider } from './prisma-muscle-group.provider';
 
 describe('PrismaMuscleGroupProvider', () => {
   const findUnique = jest.fn();
   const prisma = {
     exerciseMuscleGroup: { findUnique },
-  };
-  const provider = new PrismaMuscleGroupProvider(prisma as any);
+  } as unknown as PrismaService;
+  const provider = new PrismaMuscleGroupProvider(prisma);
 
   beforeEach(() => {
     findUnique.mockReset();
