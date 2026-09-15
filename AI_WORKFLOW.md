@@ -56,6 +56,8 @@ correction happens inline, in conversation, before code is accepted.
 | 5 | Project bootstrap tooling | Ran `npx @nestjs/cli new` in a scratch directory to inspect current scaffold defaults before writing the real project files | Scaffold defaulted to NestJS 12, ESM (`"type": "module"`), Vitest, oxlint | Rejected — see "Rejected AI suggestion" below | Hand-built package.json/tsconfig/eslint config instead, pinned to NestJS 11.x |
 | 6 | Step 0 verification | Asked to run build/lint/format/unit/e2e | `npm run build`, `npm run lint`, `npm test`, `npm run test:e2e`, `npx prettier --check` | Ran all five for real; build clean, lint 0 errors/1 warning, e2e 1/1 passing, unit tests correctly report "no tests" (none expected yet), formatting clean | Recorded in Step 0 report |
 | 7 | Step 2 — Prisma schema/migration | Wrote `prisma/schema.prisma` matching ARCHITECTURE.md §4.2, ran `prisma migrate dev --create-only`, hand-edited the generated SQL for CHECK constraints + trigram index, applied it, wrote a real-Postgres integration test | Prisma 7's `migrate` rejected a `url` in the schema datasource block; `@@unique(..., name:)` silently didn't set the DB constraint name; Docker build produced a container with a corrupted, partial `dist/` | All three investigated and root-caused for real (not guessed) — see "AI mistakes" below | Fixed; `npm run test:integration` 3/3, `docker compose up --build` verified end-to-end |
+| 8 | Step 3 — exercise metadata provider | Given explicit instructions to keep it to an interface + token + one Prisma-backed implementation + a small seed script, no extra abstraction | `MuscleGroupProvider` interface/token, `PrismaMuscleGroupProvider`, `prisma/seed.ts` (7-exercise demo set), shared `normalizeExerciseName` helper | Matched the requested shape directly; no corrections needed | Committed (`f109358`); unit tests 5/5, seed script run twice against real Postgres to confirm idempotency (stayed at 7 rows) |
+| 9 | Step 4 — unit conversion | Given explicit instruction to prefer a small conversion-factor registry over a converter-class-per-unit hierarchy | `Record<string, number>` factor table + `toKg`/`fromKg`/`isSupported`, typed `UnsupportedUnitError` | Matched the requested shape; deliberately simpler than this file's own earlier "UnitConverter interface + per-unit classes" description in `docs/ARCHITECTURE.md` §12 — the instruction to simplify is followed, not the earlier doc wording, since the human's explicit in-session direction takes precedence | Committed (`7b6484f`); unit tests 8/8 incl. a precision case that would fail under premature 2dp rounding |
 
 ---
 
@@ -250,6 +252,13 @@ What was personally verified in this session, not just generated and trusted:
   on the host's `127.0.0.1:5432` (`lsof -nP -iTCP:5432 -sTCP:LISTEN`), which was silently
   shadowing the Docker container's port mapping for host-side tools. Remapped the container to
   host port `5433` rather than touch the user's unrelated existing Postgres install.
+- **Step 3/4 commands actually executed**: `npm test` (19/19 unit tests — the first real ones in
+  this project), `npm run prisma:seed` run **twice** against a real Postgres container specifically
+  to verify the upsert-based seed is idempotent (stayed at 7 rows, checked via `psql` directly, not
+  assumed from the script's own success message), `npm run test:integration` (3/3, unaffected by
+  the new seed data since integration tests only clean up `workout_entries`/`workout_sets`),
+  `npm run test:e2e` (1/1, which also exercises the full `AppModule` bootstrap including the two
+  newly-wired modules), `npm run lint`, `npx nest build`, `npx prettier --check`.
 
 This section will keep growing as later implementation steps land.
 
@@ -257,102 +266,86 @@ This section will keep growing as later implementation steps land.
 
 ## Session Handoff
 
-**Date / session:** 2026-09-15, first implementation session (Phases 1–4 planning + Steps 0–2).
+**Date / session:** 2026-09-15. Session 1 covered Phases 1–4 planning + Steps 0–2. This update
+covers Steps 3–4, completed later the same day (continuation session).
 
 **Completed implementation steps** (of `docs/IMPLEMENTATION_PLAN.md`'s 15 steps):
-- Step 0 — NestJS bootstrap + tooling (NestJS 11.2.5, TypeScript 5.9.3, Jest/Supertest, ESLint 9,
-  Prettier, global `ConfigModule` with env validation, `GET /health`). Commit `4bb235b`.
-- Step 1 — Docker Compose dev environment (multi-stage Dockerfile, Postgres 16 + healthcheck).
-  Commit `2ed9e70`.
-- Step 2 — Database schema + Prisma migration (`WorkoutEntry`/`WorkoutSet`/`ExerciseMuscleGroup`,
-  all indexes from ARCHITECTURE.md §7, CHECK constraints, trigram search index, `PrismaService`
-  via `@prisma/adapter-pg`). Commit `09349ce`.
+- Step 0 — NestJS bootstrap + tooling. Commit `4bb235b`.
+- Step 1 — Docker Compose dev environment. Commit `2ed9e70`.
+- Step 2 — Database schema + Prisma migration. Commit `09349ce`.
+- Step 3 — Configurable exercise → muscle group provider (`MuscleGroupProvider` interface/token,
+  `PrismaMuscleGroupProvider`, `prisma/seed.ts` with a 7-exercise demo set, shared
+  `normalizeExerciseName` helper). Commit `f109358`.
+- Step 4 — Extensible unit conversion (`UnitConversionService` with a `Record<string, number>`
+  conversion-factor registry — deliberately simplified from a converter-class-per-unit hierarchy
+  per explicit instruction — plus `UnsupportedUnitError`). Also wires both new modules into
+  `AppModule`. Commit `7b6484f`.
 
-Plus the Phase 1–4 planning docs (`docs/REQUIREMENT_ANALYSIS.md`, `docs/CLARIFICATIONS.md`,
-`docs/ARCHITECTURE.md`, `docs/IMPLEMENTATION_PLAN.md`) — commits `b673004` and `eb6e761` for this
-file's own initialization.
+Plus the Phase 1–4 planning docs — commits `b673004`, `eb6e761`, and the Step 2 handoff update
+`344d989`.
 
-**Current implementation state:** Steps 0–2 fully implemented and verified for real (not just
-claimed) — see the command list below. Step 3 (exercise → muscle group seed data + provider) has
-**not** been started: no `prisma/seed.ts`, no `src/exercise-metadata/` module exists yet.
+**Current implementation state:** Steps 0–4 fully implemented and verified for real. Step 5
+(global error handling + DTO validation scaffolding) has **not** been started.
 
 **Tests currently passing/failing:**
-- Unit (`npm test`): **no test files exist yet** — this is expected at this point in the plan
-  (Step 3/4 introduce the first pure-logic unit tests: muscle-group provider, unit conversion).
-  Running it currently exits 1 with "No tests found," which is the correct, expected state, not a
-  failure to fix.
-- Integration (`npm run test:integration`): **3/3 passing**, against a real Postgres container —
-  WorkoutEntry+WorkoutSet round-trip, `UNIQUE(workout_entry_id, set_index)` rejection,
-  `CHECK(reps >= 1)` rejection.
-- E2E (`npm run test:e2e`): **1/1 passing** (`GET /health` → 200).
+- Unit (`npm test`): **19/19 passing** — first real unit-test suites in the project:
+  `normalize-exercise-name.spec.ts` (4), `prisma-muscle-group.provider.spec.ts` (5),
+  `unit-conversion.service.spec.ts` (10). "No tests found" is no longer an acceptable/expected
+  state from this checkpoint forward, and it no longer occurs.
+- Integration (`npm run test:integration`): **3/3 passing** (unchanged from Step 2 — Prisma
+  round-trip, `UNIQUE` rejection, `CHECK(reps>=1)` rejection; new seed data doesn't interfere
+  since these tests only clean up `workout_entries`/`workout_sets`).
+- E2E (`npm run test:e2e`): **1/1 passing** (`GET /health` → 200) — this also exercises full
+  `AppModule` bootstrap including the two newly-wired modules, so DI wiring is confirmed correct.
 
 **Build/lint status:**
-- `npm run build` (`nest build`): clean, `dist/main.js` at the correct top-level path.
-- `npm run lint`: 0 errors, 1 pre-existing warning (`test/app.e2e-spec.ts:23`, an
-  `@typescript-eslint/no-unsafe-argument` warning on `app.getHttpServer()` — standard NestJS
-  Supertest e2e boilerplate typing, not a real issue).
+- `npm run build`: clean, `dist/main.js` at the correct path.
+- `npm run lint`: 0 errors, 3 warnings (the 1 pre-existing Supertest typing warning, plus 2 new
+  ones in `prisma-muscle-group.provider.spec.ts` from `prisma as any` in the mock setup — expected
+  for a lightweight hand-rolled mock, not a real issue).
 - `npx prettier --check`: clean.
 
-**Docker status:** `docker compose up -d --build` verified end-to-end for real — both containers
-start, Postgres healthcheck passes, API connects to Postgres via the Prisma driver adapter
-(`[PrismaService] Connected to PostgreSQL` in logs), and `curl http://localhost:3000/health`
-returns `200 {"status":"ok"}`. As of the end of this session, the stack has been torn down
-(`docker compose down`, volume preserved) to leave a clean environment — run
-`docker compose up -d postgres` (or the full stack) to resume.
+**Docker status: NOT re-verified this checkpoint.** Per explicit instruction, a full
+`docker compose up --build` was not required unless Steps 3–4 changed something affecting
+container behavior. They added application code (new Nest modules, a seed script) but no
+Dockerfile/compose changes, and the e2e suite already boots the full `AppModule` including both
+new modules successfully — treated as sufficient proxy confidence, but a full container rebuild
+has **not** been run since the Step 2 verification. Flagging this honestly as unverified-this-
+round rather than assumed fine.
 
-**Database status:** The `everfit-workout-api_postgres_data` Docker volume exists and contains
-the fully-migrated schema (all 3 tables, all indexes, all constraints — see Step 2 commit message
-for the exact verification performed). No seed data yet (Step 3).
+**Database status:** Same Postgres container/volume as Step 2, now additionally seeded via
+`npm run prisma:seed` — verified by running it **twice** and checking row count via `psql`
+directly (stayed at 7 rows, confirming the upsert-based seed is idempotent). Postgres was stopped
+(`docker compose down`) at the end of this checkpoint; volume preserved.
 
-**Latest commit:** `09349ce` — `feat: add database schema and Prisma migration` (this
-`AI_WORKFLOW.md` update itself is uncommitted as of writing this section; see below).
+**Latest commit:** `7b6484f` — `feat: add extensible unit conversion with unit tests`.
 
-**Working tree status at end of session:** Only `AI_WORKFLOW.md` modified (this handoff section
-itself) — will be committed immediately after this is written, leaving a fully clean tree.
+**Working tree status:** Clean as of this commit; this `AI_WORKFLOW.md` update will be committed
+immediately after being written.
 
-**Known issues (accepted, documented, not blocking):**
-- `npm audit` reports 8 high-severity advisories, all transitive and all in dev/build-time or
-  unused-feature dependency paths, not the app's actual attack surface:
-  - `multer` (via `@nestjs/platform-express` on the 11.x line) — this app has no file-upload
-    endpoints and never wires up `multer`'s interceptors.
-  - `deepmerge-ts` (via `@prisma/config`, used by the `prisma` CLI's config loader) — CLI/dev-time
-    only, not part of the running API.
-  - `mysql2` (pulled in by Prisma's multi-driver support) — this project only ever uses the
-    Postgres adapter.
-  - Documented here and to be carried into the README's trade-offs section (Step 13); not
-    force-fixed via `npm audit fix --force` since that would mean reverting the deliberate
-    NestJS 11 / Prisma 7 version choices for advisories that aren't actually reachable.
-- The host machine has a pre-existing native Postgres on `127.0.0.1:5432`; the Docker Postgres is
-  intentionally mapped to host port `5433` instead (container-internal port is still 5432, so
-  `api → postgres:5432` on the Docker network is unaffected). This is now the permanent, correct
-  setup, not a temporary workaround — documented here and to be called out in the README setup
-  instructions (Step 13) so it isn't mistaken for a bug.
+**Known issues:** Same as recorded after Step 2 (transitive `npm audit` advisories in
+unreachable code paths; host port 5432 collision with a pre-existing native Postgres, permanently
+resolved via host port 5433) — nothing new introduced by Steps 3–4.
 
-**Unresolved decisions:** None blocking. The exact list of exercises to seed into
-`exercise_muscle_groups` (Step 3) hasn't been chosen yet — will pick a small, defensible common-
-exercise set (bench press, squat, deadlift, overhead press, barbell row, bicep curl, etc.) when
-Step 3 starts.
+**Unresolved decisions:** None blocking.
 
-**Architecture deviations:** None in the approved schema/index/query design itself — the Step 2
-implementation matches `docs/ARCHITECTURE.md` §4/§6/§7 exactly (verified by direct inspection of
-the applied migration SQL). The only deviations are **tooling** choices made during
-implementation, all documented above and in the AI-mistakes/rejected-suggestion sections: NestJS
-11 (not 12), CommonJS (not ESM), Jest (not Vitest) — matching what `ARCHITECTURE.md` already
-specified — and Prisma 7's driver-adapter model (`@prisma/adapter-pg` + `prisma.config.ts`),
-which `ARCHITECTURE.md` didn't anticipate because Prisma's connection-config architecture changed
-between when the doc was written and when Step 2 was implemented (same session, discovered via
-the live npm registry, not assumed).
+**Architecture deviations:** One, explicitly instructed rather than discovered: Step 4's
+`UnitConversionService` uses a single conversion-factor registry (`Record<string, number>`)
+instead of the `UnitConverter` interface + per-unit converter classes described in
+`docs/ARCHITECTURE.md` §12. This was a direct, explicit instruction ("avoid unnecessary factories
+or strategy hierarchies if a small converter registry provides the required extensibility"), not
+an AI judgment call — noted here so `ARCHITECTURE.md` §12 can be reconciled with the simpler
+actual implementation when docs are next synchronized (e.g. at the README step), rather than
+leaving the two silently inconsistent.
 
-**Exact next implementation step:** `docs/IMPLEMENTATION_PLAN.md` **Step 3 — Exercise → muscle
-group seed data + provider**:
-- `prisma/seed.ts` (seed `exercise_muscle_groups` with a small curated list)
-- `src/exercise-metadata/exercise-metadata.module.ts`
-- `src/exercise-metadata/muscle-group-provider.interface.ts`
-- `src/exercise-metadata/prisma-muscle-group.provider.ts`
-- Unit tests (`*.spec.ts`, mocked `PrismaService` — no real DB needed): known exercise resolves,
-  unknown exercise returns `null`, normalization (case/whitespace) matches correctly.
+**Exact next implementation step:** `docs/IMPLEMENTATION_PLAN.md` **Step 5 — Global error
+handling + DTO validation scaffolding**:
+- `src/common/filters/global-exception.filter.ts`
+- A `DomainError` base class (or direct handling of `UnsupportedUnitError` and future domain
+  errors) mapped to the structured error shape from `docs/CLARIFICATIONS.md` §18
+- `ValidationPipe` configuration in `main.ts`
+- Unit test for the filter directly (given a thrown error, assert the shaped response body)
 
-**Files/modules likely to be touched next:** the four files above, plus `src/app.module.ts` (to
-wire in the new `ExerciseMetadataModule`) and `package.json`'s already-defined but not-yet-
-functional `prisma:seed` script (`ts-node prisma/seed.ts`) will start actually working once
-`prisma/seed.ts` exists.
+**Files/modules likely to be touched next:** `src/common/filters/`, `src/main.ts`, and probably a
+first look at how `UnsupportedUnitError` (already thrown by `UnitConversionService`) should map
+through this filter, since that's the first real domain error in the codebase.
