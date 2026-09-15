@@ -55,6 +55,7 @@ correction happens inline, in conversation, before code is accepted.
 | 4 | Implementation plan | Asked to break approved architecture into small reviewable steps with tests + commit boundaries | 15-step `docs/IMPLEMENTATION_PLAN.md` | Approved without changes | Committed |
 | 5 | Project bootstrap tooling | Ran `npx @nestjs/cli new` in a scratch directory to inspect current scaffold defaults before writing the real project files | Scaffold defaulted to NestJS 12, ESM (`"type": "module"`), Vitest, oxlint | Rejected — see "Rejected AI suggestion" below | Hand-built package.json/tsconfig/eslint config instead, pinned to NestJS 11.x |
 | 6 | Step 0 verification | Asked to run build/lint/format/unit/e2e | `npm run build`, `npm run lint`, `npm test`, `npm run test:e2e`, `npx prettier --check` | Ran all five for real; build clean, lint 0 errors/1 warning, e2e 1/1 passing, unit tests correctly report "no tests" (none expected yet), formatting clean | Recorded in Step 0 report |
+| 7 | Step 2 — Prisma schema/migration | Wrote `prisma/schema.prisma` matching ARCHITECTURE.md §4.2, ran `prisma migrate dev --create-only`, hand-edited the generated SQL for CHECK constraints + trigram index, applied it, wrote a real-Postgres integration test | Prisma 7's `migrate` rejected a `url` in the schema datasource block; `@@unique(..., name:)` silently didn't set the DB constraint name; Docker build produced a container with a corrupted, partial `dist/` | All three investigated and root-caused for real (not guessed) — see "AI mistakes" below | Fixed; `npm run test:integration` 3/3, `docker compose up --build` verified end-to-end |
 
 ---
 
@@ -116,6 +117,75 @@ profiling shows it's actually a hot path — not assumed unnecessary.
 guarantee that shape — state the honest asymptotic bound, and defer the "is this actually fast
 enough" question to real measurement (`EXPLAIN ANALYZE`) rather than a plausible-sounding guess.
 
+### 3. `@@unique(..., name: "...")` doesn't set the database constraint name
+
+**Original AI output (`prisma/schema.prisma`, Step 2 draft):** Wrote
+`@@unique([workoutEntryId, setIndex], name: "uq_sets_entry_set_index")` on `WorkoutSet`,
+intending to name the database constraint per `ARCHITECTURE.md`'s DDL
+(`UNIQUE (workout_entry_id, set_index)`, referenced by that name elsewhere in the same document).
+
+**Why it was wrong:** In Prisma's schema DSL, `@@unique`'s `name` argument only sets the alias
+used in the generated Prisma Client's compound-key API (e.g.
+`prisma.workoutSet.findUnique({ where: { uq_sets_entry_set_index: {...} } })`) — it does **not**
+set the actual Postgres constraint name. `map` does. Running `prisma migrate dev --create-only`
+and reading the generated SQL showed the constraint had been named
+`workout_sets_workout_entry_id_set_index_key` (Prisma's auto-generated default), not the intended
+name — a mismatch that would have been easy to miss without actually inspecting the generated
+migration SQL rather than trusting the schema looked correct.
+
+**How it was caught:** Inspecting the raw generated `migration.sql` (a step already planned
+before applying, specifically to hand-add the CHECK constraints and trigram index Prisma can't
+express declaratively) — the constraint name in the SQL didn't match what the schema seemed to
+request.
+
+**Correction:** Changed `name:` to `map:` on the `@@unique` attribute, deleted the draft
+migration, and regenerated — the SQL then correctly showed
+`CREATE UNIQUE INDEX "uq_sets_entry_set_index" ON ...`.
+
+**What was learned:** For Prisma schema attributes, `name` and `map` are not interchangeable
+synonyms — `name` is client-API-facing, `map` is database-facing — and the only reliable way to
+confirm which one took effect is to read the generated SQL, not the schema file.
+
+### 4. Two real Docker build bugs surfaced only by actually running `docker compose up --build`
+
+**What happened:** After wiring in Prisma, `docker compose up -d --build` produced a container
+that crashed on startup with `Error: Cannot find module '/app/dist/main.js'`. This was not
+predicted or assumed away — it was caught because the plan called for actually running and
+curling the container (per `docs/IMPLEMENTATION_PLAN.md` Step 1's verification bar), not just
+trusting that `docker compose up` "should" work because the Dockerfile looked reasonable.
+
+**Root cause 1:** Adding `prisma.config.ts` at the project root (required by Prisma 7's new
+`migrate`/`generate` config model) gave TypeScript a root-level `.ts` file outside `src/`.
+Without an explicit `rootDir`, `tsc` silently widened its inferred common root to the project
+root, so `nest build` started emitting `dist/src/main.js` instead of `dist/main.js` — breaking
+both the Dockerfile's `CMD` and `npm run start:prod`, locally too (verified by inspecting the
+local `dist/` tree directly, not assumed from the error message alone).
+
+**Root cause 2 (found only after fixing #1 and still seeing the same crash in a fresh container):**
+A stray `tsconfig.build.tsbuildinfo` — `tsc`'s incremental-build cache, which embeds absolute file
+paths — had been generated locally (`/Users/.../src/main.ts` paths) and was not excluded by
+`.dockerignore`. `COPY . .` copied it into the build stage, where `tsc` compiled the *same*
+project again but at `/app/...` paths; the mismatched cache produced a corrupted, partial `dist/`
+(declaration files for most modules, `.js` for only a couple) — confirmed by directly inspecting
+`dist/` inside a debug build of just the `build` stage (`docker build --target build`), not
+guessed at from the symptom.
+
+**How it was caught:** Neither bug was assumed away as "should be fine" — both were confirmed by
+directly inspecting the actual filesystem state (`find dist`, `docker build --target build` for
+isolated inspection) rather than trusting a green build log, since BuildKit reported both the
+broken builds as exit-code-0 successes.
+
+**Correction:** Added explicit `rootDir`/`include` scoping to `tsconfig.build.json`; added
+`*.tsbuildinfo` and `src/generated` to `.dockerignore`. Reverified with a full, real
+`docker compose up -d --build` → `curl /health` → 200, and `docker compose logs` showing
+`[PrismaService] Connected to PostgreSQL`.
+
+**What was learned:** A green `docker build` exit code does not mean the image is correct —
+incremental-compilation caches and generated-code directories are exactly the kind of
+host-environment-specific state that silently corrupts a "works on my machine" build when copied
+into a container with different absolute paths. Verify by inspecting the actual running
+container/image, not by reading the build log for the word "error."
+
 ---
 
 ## Rejected AI suggestion (real)
@@ -167,5 +237,122 @@ What was personally verified in this session, not just generated and trusted:
 - **Step 0 commands actually executed** (not just claimed): `npm install`, `npx nest build`,
   `npm run lint`, `npm test`, `npm run test:e2e`, `npx prettier --check`. Real output for each is
   recorded in the Step 0 completion report delivered in conversation.
+- **Step 2 commands actually executed**: `prisma migrate dev --create-only` (then the SQL was
+  read and hand-edited before applying), `prisma migrate deploy`, `prisma generate`,
+  `npm run test:integration` (3/3 against a real Postgres container — insert/read round-trip,
+  `UNIQUE(workout_entry_id, set_index)` rejection, `CHECK(reps>=1)` rejection), `npm run test:e2e`,
+  `npm run lint`, `npx nest build`, `npx prettier --check`, and — critically — a full
+  `docker compose up -d --build` with `curl /health` returning `200 {"status":"ok"}` and
+  `docker compose logs` showing a real `PrismaService: Connected to PostgreSQL` line, not just a
+  successful build log. Two real bugs (see mistakes #3, #4 above) were only found because this
+  was actually run rather than assumed to work from a correct-looking Dockerfile.
+- **Environment discovery, not assumed**: found a pre-existing native Postgres already listening
+  on the host's `127.0.0.1:5432` (`lsof -nP -iTCP:5432 -sTCP:LISTEN`), which was silently
+  shadowing the Docker container's port mapping for host-side tools. Remapped the container to
+  host port `5433` rather than touch the user's unrelated existing Postgres install.
 
 This section will keep growing as later implementation steps land.
+
+---
+
+## Session Handoff
+
+**Date / session:** 2026-09-15, first implementation session (Phases 1–4 planning + Steps 0–2).
+
+**Completed implementation steps** (of `docs/IMPLEMENTATION_PLAN.md`'s 15 steps):
+- Step 0 — NestJS bootstrap + tooling (NestJS 11.2.5, TypeScript 5.9.3, Jest/Supertest, ESLint 9,
+  Prettier, global `ConfigModule` with env validation, `GET /health`). Commit `4bb235b`.
+- Step 1 — Docker Compose dev environment (multi-stage Dockerfile, Postgres 16 + healthcheck).
+  Commit `2ed9e70`.
+- Step 2 — Database schema + Prisma migration (`WorkoutEntry`/`WorkoutSet`/`ExerciseMuscleGroup`,
+  all indexes from ARCHITECTURE.md §7, CHECK constraints, trigram search index, `PrismaService`
+  via `@prisma/adapter-pg`). Commit `09349ce`.
+
+Plus the Phase 1–4 planning docs (`docs/REQUIREMENT_ANALYSIS.md`, `docs/CLARIFICATIONS.md`,
+`docs/ARCHITECTURE.md`, `docs/IMPLEMENTATION_PLAN.md`) — commits `b673004` and `eb6e761` for this
+file's own initialization.
+
+**Current implementation state:** Steps 0–2 fully implemented and verified for real (not just
+claimed) — see the command list below. Step 3 (exercise → muscle group seed data + provider) has
+**not** been started: no `prisma/seed.ts`, no `src/exercise-metadata/` module exists yet.
+
+**Tests currently passing/failing:**
+- Unit (`npm test`): **no test files exist yet** — this is expected at this point in the plan
+  (Step 3/4 introduce the first pure-logic unit tests: muscle-group provider, unit conversion).
+  Running it currently exits 1 with "No tests found," which is the correct, expected state, not a
+  failure to fix.
+- Integration (`npm run test:integration`): **3/3 passing**, against a real Postgres container —
+  WorkoutEntry+WorkoutSet round-trip, `UNIQUE(workout_entry_id, set_index)` rejection,
+  `CHECK(reps >= 1)` rejection.
+- E2E (`npm run test:e2e`): **1/1 passing** (`GET /health` → 200).
+
+**Build/lint status:**
+- `npm run build` (`nest build`): clean, `dist/main.js` at the correct top-level path.
+- `npm run lint`: 0 errors, 1 pre-existing warning (`test/app.e2e-spec.ts:23`, an
+  `@typescript-eslint/no-unsafe-argument` warning on `app.getHttpServer()` — standard NestJS
+  Supertest e2e boilerplate typing, not a real issue).
+- `npx prettier --check`: clean.
+
+**Docker status:** `docker compose up -d --build` verified end-to-end for real — both containers
+start, Postgres healthcheck passes, API connects to Postgres via the Prisma driver adapter
+(`[PrismaService] Connected to PostgreSQL` in logs), and `curl http://localhost:3000/health`
+returns `200 {"status":"ok"}`. As of the end of this session, the stack has been torn down
+(`docker compose down`, volume preserved) to leave a clean environment — run
+`docker compose up -d postgres` (or the full stack) to resume.
+
+**Database status:** The `everfit-workout-api_postgres_data` Docker volume exists and contains
+the fully-migrated schema (all 3 tables, all indexes, all constraints — see Step 2 commit message
+for the exact verification performed). No seed data yet (Step 3).
+
+**Latest commit:** `09349ce` — `feat: add database schema and Prisma migration` (this
+`AI_WORKFLOW.md` update itself is uncommitted as of writing this section; see below).
+
+**Working tree status at end of session:** Only `AI_WORKFLOW.md` modified (this handoff section
+itself) — will be committed immediately after this is written, leaving a fully clean tree.
+
+**Known issues (accepted, documented, not blocking):**
+- `npm audit` reports 8 high-severity advisories, all transitive and all in dev/build-time or
+  unused-feature dependency paths, not the app's actual attack surface:
+  - `multer` (via `@nestjs/platform-express` on the 11.x line) — this app has no file-upload
+    endpoints and never wires up `multer`'s interceptors.
+  - `deepmerge-ts` (via `@prisma/config`, used by the `prisma` CLI's config loader) — CLI/dev-time
+    only, not part of the running API.
+  - `mysql2` (pulled in by Prisma's multi-driver support) — this project only ever uses the
+    Postgres adapter.
+  - Documented here and to be carried into the README's trade-offs section (Step 13); not
+    force-fixed via `npm audit fix --force` since that would mean reverting the deliberate
+    NestJS 11 / Prisma 7 version choices for advisories that aren't actually reachable.
+- The host machine has a pre-existing native Postgres on `127.0.0.1:5432`; the Docker Postgres is
+  intentionally mapped to host port `5433` instead (container-internal port is still 5432, so
+  `api → postgres:5432` on the Docker network is unaffected). This is now the permanent, correct
+  setup, not a temporary workaround — documented here and to be called out in the README setup
+  instructions (Step 13) so it isn't mistaken for a bug.
+
+**Unresolved decisions:** None blocking. The exact list of exercises to seed into
+`exercise_muscle_groups` (Step 3) hasn't been chosen yet — will pick a small, defensible common-
+exercise set (bench press, squat, deadlift, overhead press, barbell row, bicep curl, etc.) when
+Step 3 starts.
+
+**Architecture deviations:** None in the approved schema/index/query design itself — the Step 2
+implementation matches `docs/ARCHITECTURE.md` §4/§6/§7 exactly (verified by direct inspection of
+the applied migration SQL). The only deviations are **tooling** choices made during
+implementation, all documented above and in the AI-mistakes/rejected-suggestion sections: NestJS
+11 (not 12), CommonJS (not ESM), Jest (not Vitest) — matching what `ARCHITECTURE.md` already
+specified — and Prisma 7's driver-adapter model (`@prisma/adapter-pg` + `prisma.config.ts`),
+which `ARCHITECTURE.md` didn't anticipate because Prisma's connection-config architecture changed
+between when the doc was written and when Step 2 was implemented (same session, discovered via
+the live npm registry, not assumed).
+
+**Exact next implementation step:** `docs/IMPLEMENTATION_PLAN.md` **Step 3 — Exercise → muscle
+group seed data + provider**:
+- `prisma/seed.ts` (seed `exercise_muscle_groups` with a small curated list)
+- `src/exercise-metadata/exercise-metadata.module.ts`
+- `src/exercise-metadata/muscle-group-provider.interface.ts`
+- `src/exercise-metadata/prisma-muscle-group.provider.ts`
+- Unit tests (`*.spec.ts`, mocked `PrismaService` — no real DB needed): known exercise resolves,
+  unknown exercise returns `null`, normalization (case/whitespace) matches correctly.
+
+**Files/modules likely to be touched next:** the four files above, plus `src/app.module.ts` (to
+wire in the new `ExerciseMetadataModule`) and `package.json`'s already-defined but not-yet-
+functional `prisma:seed` script (`ts-node prisma/seed.ts`) will start actually working once
+`prisma/seed.ts` exists.
