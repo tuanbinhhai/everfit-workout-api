@@ -65,6 +65,7 @@ correction happens inline, in conversation, before code is accepted.
 | 14 | Step 9 — GET /workouts/prs personal records | Explicit instruction that raw SQL is justified here (unlike Step 8) since Prisma has no `ROW_NUMBER() OVER (...)` equivalent; explicit exact-match (not partial) exercise identity requirement | One windowed `$queryRaw` tagged-template query computing and ranking all three PR metrics in a single round trip, casting NUMERIC/BIGINT columns to text to preserve precision through to JS; two small pure functions (`calculateVolume`, `calculateEpley1Rm`) mirroring the SQL's formulas, unit-tested independently; SQL ranking itself verified only via integration tests, not re-implemented in TS for unit testing | Matched the requested shape and the requested test-layer split (no duplicated ranking logic in TS just to unit-test it) | Committed (`8b18b7d`); 92 unit / 34 integration / 51 e2e, Docker-verified with real curl + psql cross-checking the DB's own raw metric computation against the API's selected winners |
 | 15 | Step 10 — GET /workouts/prs/compare range comparison | Explicit instruction to reuse Step 9's ranking logic via an optional range parameter, not duplicate it; explicit two-independent-queries design (not one range-bucketed query); explicit canonical-kg-before-rounding delta semantics | Extended `findCandidates` with an additive optional `range` param (`Prisma.sql`/`Prisma.empty` conditional fragment in the same query), extracted `computeWinnersAndMetrics()` out of the existing Step 9 method so both single-range and two-range call sites share it, `Promise.all` for the two independent range queries, delta computed from raw canonical metrics carried alongside the already-existing display records | Matched the requested shape and reuse strategy exactly; the Step 9 method WAS refactored (extracted, not rewritten) specifically because Step 10 revealed the concrete duplication the instructions anticipated — verified Step 9's own test suite still passes unmodified, confirming no behavior change | Committed (`50e730b`); 103 unit / 44 integration / 62 e2e, Docker-verified incl. explicit regression curl checks of all three prior endpoints before testing the new one, plus a delta manually cross-checked against the same Epley arithmetic run directly via psql |
 | 16 | Step 11 — structured request logging | Explicit library preference (nestjs-pino/pino-http unless a concrete reason not to), explicit field/sensitivity constraints | Read nestjs-pino's actual README/type definitions before writing any code (not assumed from training knowledge) — this is what surfaced the Node >=22.12 requirement and the exact `genReqId`/serializer API shape; custom req/res serializers reduced to `{id, method, url}`/`{statusCode}` only | Matched the requested design; caught and fixed a real gap myself before it reached commit — see "AI mistakes" below | Committed (`a043d03`); 112 unit / 44 integration / 64 e2e, Docker rebuilt on the now-required Node 22 base image and manually verified incl. a real DB-outage-triggered 500 (not a fake endpoint) |
+| 17 | Step 12 — performance verification at 50k+ entries | Explicit instruction: real Postgres, real `EXPLAIN (ANALYZE, BUFFERS)`, deterministic batch-inserted seed data (no HTTP one-at-a-time inserts), capture the *actual* SQL Prisma sends rather than hand-reconstructing it, don't assume the trigram index is used — verify | `scripts/seed-scale-test.ts` (deterministic index-arithmetic generator, worst-case 40%-concentration exercise), `scripts/explain-queries.ts` (Prisma query-event capture + re-run under `EXPLAIN`), `docs/PERFORMANCE_NOTES.md` | Matched the requested design; found and fixed three real bugs in the benchmark tooling itself via actual execution, not review — see "AI mistakes" below. Confirmed (not assumed) that the trigram GIN index is used for the PR query's equality lookup but *not* for `findHistory`'s substring search at this data shape, and confirmed the PR query's cost scales with candidate-set size as `ARCHITECTURE.md` §5.2 predicted | 220 unit/integration/e2e tests still pass unmodified (no query/schema change was evidence-justified), lint/build/prettier clean, Docker-verified with real curl + psql; perf dataset generated, measured, and cleaned per the documented commands |
 
 ---
 
@@ -330,6 +331,59 @@ the test's expected value (`-9.09`), not the code, and added a comment explainin
 learned:** percentage-delta tests built by "swap the inputs from another test" need the expected
 output recomputed from scratch, not assumed symmetric — the denominator moves too.
 
+### 8. Three real bugs found while building the Step 12 performance-benchmark tooling
+
+**What happened:** None of these were predicted in the plan — all three were only found by actually
+running the scripts against real Postgres and reading the output carefully, not by reviewing the
+code.
+
+**Bug 1 — explaining the wrong query.** `scripts/explain-queries.ts`'s first version captured
+Prisma's query-event log and explained only the *last* captured query per scenario. `findHistory()`
+uses Prisma's `include: { sets: ... }`, which issues **two** separate SQL statements per call (one
+for `workout_entries` with the actual filter/cursor/pagination logic under test, a second batched
+lookup for `workout_sets`). Explaining only the last statement silently explained the sets lookup —
+identical for several scenarios — for 5 of 7 benchmark scenarios, never the entries query the step
+was actually meant to measure. Caught by noticing the captured SQL/plan was byte-identical across
+scenarios 3, 4, and 5b, which should have produced different query shapes (partial search vs.
+combined filter vs. muscle-group `IN` list) — that couldn't be right, which led to rereading
+`workouts.repository.ts` and finding the two-statement `include` behavior. Fixed by explaining every
+query captured during each scenario, not just the last.
+
+**Bug 2 — the fix causing a new bug.** Explaining every captured query per scenario meant issuing
+new `$queryRawUnsafe(EXPLAIN ...)` calls from inside a loop over the same `captured` array that the
+`$on('query', ...)` listener also appends to — so the loop picked up its own `EXPLAIN` statement
+mid-iteration and tried to run `EXPLAIN (ANALYZE, BUFFERS) EXPLAIN (ANALYZE, BUFFERS) ...`, a syntax
+error. Caught immediately from the actual Postgres error message on the very next run. Fixed by
+snapshotting the captured list (`[...captured]`) before iterating it.
+
+**Bug 3 — reseeded data during what was meant to be a cleanup run.** `scripts/seed-scale-test.ts`
+called `main()` unconditionally at module load. `clean-scale-test.ts` and `explain-queries.ts` both
+import `PERF_USER`/`PERF_USER_SECONDARY` from it — merely importing those constants for their own
+use silently re-triggered a full seed attempt as an import side effect. Combined with a separate,
+genuine discovery that every e2e/integration spec's `beforeEach` runs an **unscoped**
+`prisma.workoutEntry.deleteMany()`/`workoutSet.deleteMany()` (not filtered to that test's own data),
+running the regression suite while the perf dataset existed wiped it entirely as a side effect —
+which meant, by the time `npm run perf:clean` ran afterward, the table was already empty, so the
+import-triggered seed's own existence guard (`if (existingPrimary > 0) return;`) didn't fire, and it
+silently reinserted a fresh 50,200-row dataset in the middle of what was supposed to be a cleanup
+run. Caught by reading `perf:clean`'s actual console output line-by-line (`"Removed 0 entries..."`
+immediately followed by full seeding progress logs, which made no sense for a delete-only script)
+rather than assuming a clean exit code meant the cleanup worked. Fixed by gating
+`seed-scale-test.ts`'s `main()` call behind `if (require.main === module)`.
+
+**What was learned:** (1) An ORM's relation-`include` can silently fan out into multiple SQL
+statements — a benchmark harness built on "capture the query Prisma sends" needs to account for
+*all* statements a call produces, not assume one call means one query. (2) An event listener
+attached to a client used both to run application queries and to run diagnostic `EXPLAIN` queries
+against the same client will also capture the diagnostic queries themselves — a self-referential
+trap that's easy to miss until it produces a nonsensical double-`EXPLAIN`. (3) A module executing
+side effects at import time (`main()` with no entry-point guard) is a real hazard the moment any
+other file imports it for anything else, including just a couple of exported constants — and an
+unscoped test-cleanup `deleteMany()` is itself a landmine for any other process sharing the same
+database, not just for other test files (mistake #6 in Step 8 already covered the test-file-vs-
+test-file case; this is the same root cause — unscoped cleanup — surfacing again against a
+completely different kind of neighbor).
+
 ---
 
 ## Rejected AI suggestion (real)
@@ -472,6 +526,29 @@ What was personally verified in this session, not just generated and trusted:
   `req.id` in logs) was only found by actually reading real JSON log lines during manual
   verification — the automated test suite was green throughout because it never asserted on the
   one field that mattered.
+- **Step 12 commands actually executed**: `npm run perf:seed` against real Docker Postgres (50,200
+  entries / 200,799 sets, 11.2s), row counts independently re-verified via direct `psql` queries
+  (not just the seed script's own console output), `ANALYZE` run explicitly, `npm run perf:explain`
+  run three times (once revealing bug 1, once revealing bug 2, once producing the real evidence used
+  in `docs/PERFORMANCE_NOTES.md`), a real `POST /workouts` write-path check against the Docker API
+  container with the perf dataset present, result verified row-by-row via `psql` (not trusted from
+  the HTTP response alone), an atomicity check (invalid batch rejected, row count independently
+  confirmed unchanged), the full index inventory and `pg_stat_user_indexes` usage stats pulled
+  directly from Postgres, then the full regression sweep (`npm test` 112/112, `npm run
+  test:integration` 44/44, `npm run test:e2e` 64/64, `npm run lint`, `npm run build`, `npx prettier
+  --check` — all clean, re-run again after the bug-3 fix), a full Docker rebuild + health/POST/GET
+  smoke test, and `npm run perf:clean` re-verified via direct `psql` count (`0` rows) after fixing
+  bug 3.
+- **A query-plan claim verified by reading the actual index definitions, not assumed from the index
+  name**: before writing up that the PR query's candidate lookup used the `pg_trgm` GIN index for an
+  *equality* predicate (not just `LIKE`), the actual `CREATE INDEX ... USING gin (... gin_trgm_ops)`
+  DDL was read from the migration file and cross-checked against `\d workout_entries` in a live
+  `psql` session, rather than assuming a trigram index only ever accelerates substring matches.
+- **A confusing script output was read as a real signal, not brushed past**: `npm run perf:clean`
+  printing `"Removed 0 entries and 0 sets"` immediately followed by full reseed progress logs looked
+  like harmless noise at first glance, but didn't match what a delete-only script should ever print —
+  treating that as a real discrepancy (rather than "the command exited 0, so it's fine") is what
+  surfaced bug 3 above.
 
 This section will keep growing as later implementation steps land.
 
@@ -481,7 +558,8 @@ This section will keep growing as later implementation steps land.
 
 **Date / session:** 2026-09-15/16. Session 1 (09-15): Phases 1–4 planning + Steps 0–2.
 Session 2 (09-15, continuation): Steps 3–4. Session 3 (09-15, continuation): Steps 5–7 + end-of-day
-closeout. Session 4 (09-16): context restored and re-verified, then Steps 8–11.
+closeout. Session 4 (09-16): context restored and re-verified, then Steps 8–11. Session 5 (09-16,
+continuation): Step 12 (performance verification).
 
 **Completed implementation steps** (of `docs/IMPLEMENTATION_PLAN.md`'s 15 steps):
 - Step 0 — NestJS bootstrap + tooling. Commit `4bb235b`.
@@ -498,73 +576,85 @@ closeout. Session 4 (09-16): context restored and re-verified, then Steps 8–11
   achievement date, via one windowed `$queryRaw` query. Commit `8b18b7d`.
 - Step 10 — `GET /workouts/prs/compare`: two caller-supplied date ranges, reusing Step 9's exact
   ranking logic. Commit `50e730b`.
-- Step 11 — Structured request logging: `nestjs-pino`/`pino-http` replace Nest's console logger
-  everywhere (app startup, existing `Logger` calls, and one automatic per-request completion log
-  with method/url/statusCode/responseTime/request-id). Request id reuses a client-supplied
-  `x-request-id` header when present, otherwise generates one, echoed back as a response header.
-  Custom req/res serializers emit only `{id, method, url}`/`{statusCode}` — never headers, query
-  params, or bodies. `GlobalExceptionFilter` needed no code changes: `app.useLogger()` routes its
-  existing `Logger` calls through pino automatically. Required bumping the Dockerfile's Node base
-  image from 20 to 22 (nestjs-pino v5 requires >=22.12 — discovered by reading the library's own
-  docs before installing, not assumed). Commit `a043d03`.
+- Step 11 — Structured request logging: `nestjs-pino`/`pino-http`, request-id correlation, Node
+  runtime bumped to >=22.12. Commit `a043d03`.
+- Step 12 — Performance verification at 50k+ entries: deterministic seed/clean/explain tooling
+  (`scripts/`), real `EXPLAIN (ANALYZE, BUFFERS)` evidence for 7 benchmark scenarios against a real
+  50,000-entry/199,999-set single-user dataset, a write-path sanity check, an index-strategy review,
+  and `docs/PERFORMANCE_NOTES.md`. No schema/query/index change was evidence-justified — every
+  finding either confirmed the existing design (candidate-set-proportional PR cost, appropriate
+  index selection for the base/range-bounded/muscle-group cases) or documented a sub-3ms
+  characteristic not worth changing (deep-cursor pagination cost growing with cursor depth,
+  trigram index not used for substring search at this data shape). Commit pending (this checkpoint).
 
 Plus Phase 1–4 planning docs (`b673004`) and the `AI_WORKFLOW.md` handoff updates (`eb6e761`,
 `344d989`, `0f2ef49`, `d110c96`, `0e46962`, `073b44c`, `613589f`, `e7b8888`).
 
-**Current implementation state:** Steps 0–11 fully implemented and verified for real. Steps 12–14
-(50k-entry seed + `EXPLAIN ANALYZE` performance verification, README, final adversarial
-self-review) have **not** been started.
+**Current implementation state:** Steps 0–12 fully implemented and verified for real. Steps 13–14
+(README/video walkthrough finalization, final adversarial self-review) have **not** been started.
 
-**Tests currently passing/failing:**
-- Unit (`npm test`): **112/112 passing** — adds 9 new logging tests: `resolveRequestId` (reuse a
-  supplied header, generate when absent/empty/whitespace, first-value-of-array, uniqueness across
-  calls) and `createPinoHttpOptions` (log level from config, `genReqId` reuse+response-header
-  behavior, serializers expose `id`/`method`/`url`/`statusCode` and nothing else — including `id`,
-  added after mistake #7 below was fixed).
-- Integration (`npm run test:integration`, real Postgres, `--runInBand`): **44/44 passing**,
-  unchanged (logging is an HTTP-layer/bootstrap concern, not exercised by these repository-level
-  tests).
-- E2E (`npm run test:e2e`, real Postgres, `--runInBand`): **64/64 passing** — adds 2 new focused
-  request-id contract tests (generates+returns one when absent, reuses a client-supplied one) to
-  the existing health e2e file, without duplicating any per-endpoint API test.
+**Tests currently passing/failing:** Unchanged in count from the Step 11 checkpoint — Step 12 added
+no application code, only standalone `scripts/` tooling and docs, and no query/schema change was
+evidence-justified, so no test was added or modified.
+- Unit (`npm test`): **112/112 passing**.
+- Integration (`npm run test:integration`, real Postgres, `--runInBand`): **44/44 passing**.
+- E2E (`npm run test:e2e`, real Postgres, `--runInBand`): **64/64 passing**.
+- Re-run in full at the end of Step 12 (after the bug-3 fix in `scripts/seed-scale-test.ts`) to
+  confirm the perf-tooling changes touched nothing test-relevant — same 112/44/64 result.
 
 **Build/lint/format status:**
 - `npm run build`: clean, `dist/main.js` at the correct path.
-- `npm run lint`: 0 errors, 0 warnings.
-- `npx prettier --check`: clean.
+- `npm run lint`: 0 errors, 0 warnings (`src`/`test`); `npx eslint "scripts/**/*.ts"` also 0/0.
+- `npx tsc --noEmit`: 0 errors across the whole project including `scripts/`.
+- `npx prettier --check`: clean (`src`, `test`, and `scripts`).
 
-**Docker status:** Rebuilt on the new `node:22-slim` base (required, not optional — the build
-itself proves the Node bump works) and manually verified: `GET /health` (200, `x-request-id`
-header present, structured JSON logs), valid `POST /workouts`, a validation 400, and a malformed-
-cursor 400 — all logged at info level with method/url/statusCode/responseTime/request-id, never as
-errors. A **real** unexpected 500 was triggered by stopping the Postgres container mid-request
-(not a throwaway test endpoint): client got a clean generic 500 with zero leaked internals, while
-the server log carried the full `PrismaClientKnownRequestError` stack, correlated by request id
-with pino-http's own per-request outcome log. Postgres was restarted and recovery confirmed, then
-all four existing endpoints (`POST /workouts`, `GET /workouts`, `GET /workouts/prs`,
-`GET /workouts/prs/compare`) regression-checked — no response-contract changes. Stack torn down
+**Docker status:** Rebuilt (`docker compose up -d --build`) and manually verified against the real
+50k-entry perf dataset: `GET /health` (200), a valid bulk `POST /workouts` write verified correct
+via direct `psql` read-back, an invalid batch correctly rejected with zero partial commit (row
+count independently confirmed unchanged before/after). After the perf dataset was cleaned
+(`npm run perf:clean`, verified `0` rows via `psql`), a final smoke test (`GET /health`,
+`POST /workouts`, `GET /workouts`) was run against a fresh row to confirm the stack still works
+end-to-end post-cleanup; that smoke-test row was then deleted. Stack torn down
 (`docker compose down`) at the end; volume preserved.
 
-**Database status:** Same Postgres volume as previous checkpoints, now also containing this
-checkpoint's manual-verification data (`log-user`) — harmless, dev-only, left in place.
+**Database status:** Postgres volume preserved. The perf dataset (`perf-user`/`perf-user-2`, ~50.2k
+entries) was generated, measured, and then fully removed (`npm run perf:clean`, verified via direct
+`psql` count = 0). Note for future sessions: **the regression suite's test cleanup is unscoped**
+(`prisma.workoutEntry.deleteMany()`/`workoutSet.deleteMany()` with no `where`, in every e2e/
+integration spec's `beforeEach`) — running `npm test:integration`/`npm run test:e2e` while any perf
+or manual-verification data exists will silently delete it. Any previous checkpoints' leftover
+dev/manual-verification data (e.g. `log-user`) no longer exists as of this session, wiped as a side
+effect of this step's regression-suite runs — harmless (dev-only data), but noted here so it isn't
+mistaken for a fresh loss.
 
-**Latest commit:** `a043d03` — `chore: add structured request logging` (this `AI_WORKFLOW.md`
-update will be its own commit immediately after being written).
+**Latest commit:** `a043d03` — `chore: add structured request logging`. This session's work
+(Step 12: `scripts/`, `docs/PERFORMANCE_NOTES.md`, `package.json` script additions, this
+`AI_WORKFLOW.md` update) is uncommitted as of this checkpoint — see "Working tree status" below.
 
-**Working tree status:** Clean prior to this update, verified via `git status` before committing.
+**Working tree status:** Uncommitted at this checkpoint:
+- Modified: `package.json` (adds `perf:seed`/`perf:clean`/`perf:explain` scripts)
+- New: `scripts/seed-scale-test.ts`, `scripts/clean-scale-test.ts`, `scripts/explain-queries.ts`
+- New: `docs/PERFORMANCE_NOTES.md`
+- Modified: `AI_WORKFLOW.md` (this update)
 
-**Known issues:** Unchanged from the last checkpoint (transitive `npm audit` advisories in
+Plan: one implementation commit for the `scripts/`/`package.json`/`docs/PERFORMANCE_NOTES.md`
+changes (e.g. `perf: verify query performance at 50k workout entries`), then a separate
+`AI_WORKFLOW.md` commit, per this project's established convention. No generated dataset files are
+being committed — the perf dataset lives only in the local Postgres volume, generated on demand.
+
+**Known issues:** Unchanged from the Step 11 checkpoint (transitive `npm audit` advisories in
 unreachable code paths; host port 5432→5433 remap; `--runInBand` on the integration/e2e npm
-scripts) **plus one new, permanent, evidence-based change**: the Docker base image and
-`package.json` `engines` field now require Node >=22 (was >=20) — not a regression, a real
-requirement of the logging library actually installed, to be called out explicitly in the README
-so it isn't mistaken for an arbitrary version bump.
+scripts; Node >=22.12 requirement) **plus one new, real, non-blocking observation**: the
+regression suite's unscoped test-cleanup `deleteMany()` calls (see "Database status" above) mean
+perf/manual-verification data and the automated test suites cannot coexist in the same Postgres
+instance across a test run — not a bug in the shipped application (test cleanup code is not
+production code), but a real operational note for anyone running this workflow again.
 
 **Unresolved decisions:** None blocking.
 
-**Outstanding assignment requirement:** unchanged — the genuine rejected-AI-suggestion
-requirement is still treated as satisfied only by the one real Step 0 example. No genuine
-rejection occurred this checkpoint; none was invented.
+**Outstanding assignment requirement:** unchanged — the genuine rejected-AI-suggestion requirement
+is still treated as satisfied only by the one real Step 0 example. No genuine rejection occurred
+this checkpoint; none was invented.
 
 **Architecture deviations:**
 1. (Carried forward) Step 4's flat conversion-factor registry vs. `ARCHITECTURE.md` §12's
@@ -577,22 +667,20 @@ rejection occurred this checkpoint; none was invented.
    §5.3 closely — the step where raw SQL turned out correct and necessary, the mirror image of #3.
 5. (Carried forward, not really a deviation) Step 10's route matches `ARCHITECTURE.md` §1's
    original sketch exactly.
-6. (New) Node runtime requirement bumped from >=20 to >=22.12, and the Dockerfile's base image
-   from `node:20-slim` to `node:22-slim` — a real, externally-imposed requirement (nestjs-pino v5),
-   not a design choice revisited; to document in the README's setup/requirements section.
+6. (Carried forward) Node runtime requirement >=22.12, Dockerfile base `node:22-slim` — a real,
+   externally-imposed requirement (nestjs-pino v5), not a design choice revisited; to document in
+   the README's setup/requirements section.
+7. (New, confirms rather than deviates) `ARCHITECTURE.md` §5.2's PR-query cost model — "cost is
+   proportional to candidate-set size, not O(1)" — is now backed by real `EXPLAIN ANALYZE` evidence
+   (§10 of `docs/PERFORMANCE_NOTES.md`), not just stated as a corrected assumption. No architecture
+   change; the previously "unverified" flag on this claim can be removed at the README step.
 
-**Exact next implementation step:** `docs/IMPLEMENTATION_PLAN.md` **Step 12 — Seed script for
-scale testing + `EXPLAIN ANALYZE` verification**: generate 50,000+ `WorkoutEntry`/`WorkoutSet`
-rows for one synthetic user, including a worst-case single-exercise concentration scenario (per
-`ARCHITECTURE.md` §5.2's corrected, unverified cost model), then run and record real
-`EXPLAIN ANALYZE` output for history filtering, partial-match search, muscle-group filtering, PR
-queries (including the worst-case concentration), and pagination at depth — in
-`docs/PERFORMANCE_NOTES.md`. This is the step where every performance claim flagged as
-"unverified" throughout `ARCHITECTURE.md` since Phase 3 finally gets checked against a real query
-planner, not assumed correct from index design alone.
+**Exact next implementation step:** `docs/IMPLEMENTATION_PLAN.md` **Step 13 — README finalization
+and video walkthrough**, per the plan's own scope (not started — this session was explicitly scoped
+to Step 12 only, with an explicit instruction not to begin Step 13). The carried-forward
+architecture deviations above (items 1–3, 7) are all flagged as "reconcile/document at the README
+step," so Step 13 should address each of them explicitly rather than leaving them as open items.
 
-**Files/modules likely to be touched next:** new `scripts/seed-scale-test.ts`, new
-`docs/PERFORMANCE_NOTES.md`, and likely corrections to `docs/ARCHITECTURE.md` itself if any claim
-turns out wrong under real `EXPLAIN ANALYZE` output — per that document's own "open items carried
-forward" note, this is expected to possibly happen, not a sign something went wrong if it does.
-against real query plans rather than remaining documented-but-unverified assumptions.
+**Files/modules likely to be touched next:** `README.md` (new or substantially rewritten),
+`VIDEO_WALKTHROUGH.md`, and possibly a short `docs/ARCHITECTURE.md` addendum noting which
+previously-flagged "unverified" performance claims are now confirmed by `docs/PERFORMANCE_NOTES.md`.
