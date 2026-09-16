@@ -6,6 +6,41 @@ no fabricated rejections.
 
 ---
 
+## Submission summary
+
+For a reviewer short on time — everything below is expanded in full, real chronological detail
+further down this file.
+
+**Required: at least 2 real AI outputs that were wrong/suboptimal and were corrected.** Satisfied
+many times over (9 numbered entries under "AI mistakes / suboptimal outputs" below, plus 2 minor
+test-expectation notes). The two recommended as the strongest, most self-contained examples:
+
+1. **Custom pino-http serializer silently dropped the request id from logs** (mistake #7) — a
+   change that compiled, passed lint, and passed its own unit tests, but quietly defeated the one
+   thing the correlation-id feature exists for. Only caught by reading real log output during
+   manual verification.
+2. **Performance benchmark explained the wrong Prisma-generated query** (mistake #8, bug 1) —
+   Prisma's `include: { sets: ... }` fans out into two SQL statements per call; the first version
+   of the benchmark script only captured/explained the last one, silently measuring the wrong
+   query for 5 of 7 Step 12 scenarios. Caught by noticing identical output across scenarios that
+   should have differed.
+
+**Required: at least 1 genuine rejected AI suggestion.** Satisfied once, in Step 0 (see "Rejected
+AI suggestion" below) — checked against all four required elements:
+1. A concrete AI suggestion: `npx @nestjs/cli new`'s actual scaffold output (NestJS 12, ESM,
+   Vitest, oxlint).
+2. Explicit rejection: not adopted for the real project.
+3. Reason given: contradicts an already-approved architecture decision (Jest+Supertest), and
+   trades a more mature/documented stack for a newer one with no concrete benefit for this
+   take-home.
+4. Chosen alternative + trade-off documented: NestJS 11/CommonJS/Jest hand-configured instead, with
+   the accepted `multer`-advisory trade-off explicitly written down.
+
+No second rejected-suggestion example was manufactured to pad this out — none occurred, and none
+was invented.
+
+---
+
 ## AI tools used
 
 | Tool | Purpose | Phases used |
@@ -66,6 +101,7 @@ correction happens inline, in conversation, before code is accepted.
 | 15 | Step 10 — GET /workouts/prs/compare range comparison | Explicit instruction to reuse Step 9's ranking logic via an optional range parameter, not duplicate it; explicit two-independent-queries design (not one range-bucketed query); explicit canonical-kg-before-rounding delta semantics | Extended `findCandidates` with an additive optional `range` param (`Prisma.sql`/`Prisma.empty` conditional fragment in the same query), extracted `computeWinnersAndMetrics()` out of the existing Step 9 method so both single-range and two-range call sites share it, `Promise.all` for the two independent range queries, delta computed from raw canonical metrics carried alongside the already-existing display records | Matched the requested shape and reuse strategy exactly; the Step 9 method WAS refactored (extracted, not rewritten) specifically because Step 10 revealed the concrete duplication the instructions anticipated — verified Step 9's own test suite still passes unmodified, confirming no behavior change | Committed (`50e730b`); 103 unit / 44 integration / 62 e2e, Docker-verified incl. explicit regression curl checks of all three prior endpoints before testing the new one, plus a delta manually cross-checked against the same Epley arithmetic run directly via psql |
 | 16 | Step 11 — structured request logging | Explicit library preference (nestjs-pino/pino-http unless a concrete reason not to), explicit field/sensitivity constraints | Read nestjs-pino's actual README/type definitions before writing any code (not assumed from training knowledge) — this is what surfaced the Node >=22.12 requirement and the exact `genReqId`/serializer API shape; custom req/res serializers reduced to `{id, method, url}`/`{statusCode}` only | Matched the requested design; caught and fixed a real gap myself before it reached commit — see "AI mistakes" below | Committed (`a043d03`); 112 unit / 44 integration / 64 e2e, Docker rebuilt on the now-required Node 22 base image and manually verified incl. a real DB-outage-triggered 500 (not a fake endpoint) |
 | 17 | Step 12 — performance verification at 50k+ entries | Explicit instruction: real Postgres, real `EXPLAIN (ANALYZE, BUFFERS)`, deterministic batch-inserted seed data (no HTTP one-at-a-time inserts), capture the *actual* SQL Prisma sends rather than hand-reconstructing it, don't assume the trigram index is used — verify | `scripts/seed-scale-test.ts` (deterministic index-arithmetic generator, worst-case 40%-concentration exercise), `scripts/explain-queries.ts` (Prisma query-event capture + re-run under `EXPLAIN`), `docs/PERFORMANCE_NOTES.md` | Matched the requested design; found and fixed three real bugs in the benchmark tooling itself via actual execution, not review — see "AI mistakes" below. Confirmed (not assumed) that the trigram GIN index is used for the PR query's equality lookup but *not* for `findHistory`'s substring search at this data shape, and confirmed the PR query's cost scales with candidate-set size as `ARCHITECTURE.md` §5.2 predicted | 220 unit/integration/e2e tests still pass unmodified (no query/schema change was evidence-justified), lint/build/prettier clean, Docker-verified with real curl + psql; perf dataset generated, measured, and cleaned per the documented commands |
+| 18 | Step 13 — documentation finalization | Explicit instruction: README must describe what the code ACTUALLY does, not restate stale planning docs; verify every API example against real running code, not invented; do not claim pg_trgm is always used for substring search; synchronize `ARCHITECTURE.md` with the real implementation without rewriting historical `AI_WORKFLOW.md` entries | Read every controller/DTO/service/repository/schema/migration/docker-compose file directly (not relied on earlier markdown) before writing `README.md`; ran real `POST`/`GET` requests against the live Docker API for every example in the README and the video script (PR/PR-compare/history/pagination/error responses) rather than reconstructing them from types; updated `ARCHITECTURE.md` §5.2/§6/§7/§8/§9/§12/§13 and the "Open items" close to match measured Step 12 evidence and the actual implemented design (flat unit-conversion factor table, single merged controller, Prisma query builder for history) | Matched the requested scope; no code/behavior change, so no test modification needed — verified by rerunning the full suite anyway | 220 unit/integration/e2e tests unchanged and passing, lint/build/prettier clean, README quick-start manually re-verified against a clean `docker compose down && up --build`, `VIDEO_WALKTHROUGH.md` created and confirmed excluded from `git status` via `.git/info/exclude` |
 
 ---
 
@@ -549,6 +585,25 @@ What was personally verified in this session, not just generated and trusted:
   like harmless noise at first glance, but didn't match what a delete-only script should ever print —
   treating that as a real discrepancy (rather than "the command exited 0, so it's fine") is what
   surfaced bug 3 above.
+- **Step 13 commands actually executed**: read every controller, DTO, service, repository,
+  `prisma/schema.prisma`, the full migration SQL, `docker-compose.yml`, `Dockerfile`, and
+  `package.json` directly before writing a word of `README.md`, rather than trusting earlier
+  planning docs to still be accurate. Brought the Docker stack up and ran real `POST /workouts`,
+  `GET /workouts` (base case, partial search, unit conversion, muscle-group filter, page 2 via a
+  real returned cursor), `GET /workouts/prs`, `GET /workouts/prs/compare`, a malformed-cursor
+  request, an unsupported-unit request, and an impossible-date request — every JSON example in
+  `README.md` and `VIDEO_WALKTHROUGH.md` is a real captured response, not reconstructed from
+  reading the TypeScript types. After writing the docs, re-ran the full sweep (`npm test` 112/112,
+  `npm run test:integration` 44/44, `npm run test:e2e` 64/64, `npm run lint`, `npm run build`,
+  `npx prettier --check`) to confirm documentation-only changes hadn't altered behavior, and
+  manually re-verified the README's own quick-start instructions from a clean
+  `docker compose down` → `up -d --build` → `curl /health`.
+- **Historical documents labeled, not silently rewritten**: `docs/CLARIFICATIONS.md` and
+  `docs/IMPLEMENTATION_PLAN.md` were left substantively as originally written (per this step's
+  explicit instruction not to rewrite history unnecessarily), with a short banner added to each
+  pointing to `README.md`/`ARCHITECTURE.md` as the current source of truth — rather than either
+  leaving them silently stale-looking or rewriting them to pretend the plan and the implementation
+  never diverged.
 
 This section will keep growing as later implementation steps land.
 
@@ -559,7 +614,8 @@ This section will keep growing as later implementation steps land.
 **Date / session:** 2026-09-15/16. Session 1 (09-15): Phases 1–4 planning + Steps 0–2.
 Session 2 (09-15, continuation): Steps 3–4. Session 3 (09-15, continuation): Steps 5–7 + end-of-day
 closeout. Session 4 (09-16): context restored and re-verified, then Steps 8–11. Session 5 (09-16,
-continuation): Step 12 (performance verification).
+continuation): Step 12 (performance verification). Session 6 (09-16, continuation): Step 13
+(documentation finalization).
 
 **Completed implementation steps** (of `docs/IMPLEMENTATION_PLAN.md`'s 15 steps):
 - Step 0 — NestJS bootstrap + tooling. Commit `4bb235b`.
@@ -581,106 +637,99 @@ continuation): Step 12 (performance verification).
 - Step 12 — Performance verification at 50k+ entries: deterministic seed/clean/explain tooling
   (`scripts/`), real `EXPLAIN (ANALYZE, BUFFERS)` evidence for 7 benchmark scenarios against a real
   50,000-entry/199,999-set single-user dataset, a write-path sanity check, an index-strategy review,
-  and `docs/PERFORMANCE_NOTES.md`. No schema/query/index change was evidence-justified — every
-  finding either confirmed the existing design (candidate-set-proportional PR cost, appropriate
-  index selection for the base/range-bounded/muscle-group cases) or documented a sub-3ms
-  characteristic not worth changing (deep-cursor pagination cost growing with cursor depth,
-  trigram index not used for substring search at this data shape). Commit pending (this checkpoint).
+  and `docs/PERFORMANCE_NOTES.md`. No schema/query/index change was evidence-justified. Commit
+  `9dc7f36`.
+- Step 13 — Documentation finalization: `README.md` (new, the primary reviewer-facing document,
+  every API example captured from real running requests), `docs/ARCHITECTURE.md` synchronized with
+  the actual implementation (unit-conversion design, single merged controller, Prisma-builder
+  history query, the two Step 12 corrections to the trigram-index and PR-cost claims, deep-cursor
+  pagination finding), historical-document banners added to `docs/CLARIFICATIONS.md` and
+  `docs/IMPLEMENTATION_PLAN.md` (left otherwise unrewritten), a "Submission summary" index added
+  near the top of this file, and `VIDEO_WALKTHROUGH.md` (private, not committed — see "Working tree
+  status" below). No application code changed. Commit pending (this checkpoint).
 
 Plus Phase 1–4 planning docs (`b673004`) and the `AI_WORKFLOW.md` handoff updates (`eb6e761`,
-`344d989`, `0f2ef49`, `d110c96`, `0e46962`, `073b44c`, `613589f`, `e7b8888`).
+`344d989`, `0f2ef49`, `d110c96`, `0e46962`, `073b44c`, `613589f`, `e7b8888`, `26c63ab`).
 
-**Current implementation state:** Steps 0–12 fully implemented and verified for real. Steps 13–14
-(README/video walkthrough finalization, final adversarial self-review) have **not** been started.
+**Current implementation state:** Steps 0–13 fully implemented/documented and verified for real.
+Step 14 (final adversarial self-review) has **not** been started.
 
-**Tests currently passing/failing:** Unchanged in count from the Step 11 checkpoint — Step 12 added
-no application code, only standalone `scripts/` tooling and docs, and no query/schema change was
-evidence-justified, so no test was added or modified.
+**Tests currently passing/failing:** Unchanged in count from the Step 12 checkpoint — Step 13 is
+documentation-only, no application code changed.
 - Unit (`npm test`): **112/112 passing**.
 - Integration (`npm run test:integration`, real Postgres, `--runInBand`): **44/44 passing**.
 - E2E (`npm run test:e2e`, real Postgres, `--runInBand`): **64/64 passing**.
-- Re-run in full at the end of Step 12 (after the bug-3 fix in `scripts/seed-scale-test.ts`) to
-  confirm the perf-tooling changes touched nothing test-relevant — same 112/44/64 result.
+- Re-run in full after all documentation changes landed, specifically to confirm nothing
+  behavioral had changed — same 112/44/64 result.
 
 **Build/lint/format status:**
 - `npm run build`: clean, `dist/main.js` at the correct path.
-- `npm run lint`: 0 errors, 0 warnings (`src`/`test`); `npx eslint "scripts/**/*.ts"` also 0/0.
-- `npx tsc --noEmit`: 0 errors across the whole project including `scripts/`.
-- `npx prettier --check`: clean (`src`, `test`, and `scripts`).
+- `npm run lint`: 0 errors, 0 warnings.
+- `npx prettier --check` (`src`, `test`): clean.
 
-**Docker status:** Rebuilt (`docker compose up -d --build`) and manually verified against the real
-50k-entry perf dataset: `GET /health` (200), a valid bulk `POST /workouts` write verified correct
-via direct `psql` read-back, an invalid batch correctly rejected with zero partial commit (row
-count independently confirmed unchanged before/after). After the perf dataset was cleaned
-(`npm run perf:clean`, verified `0` rows via `psql`), a final smoke test (`GET /health`,
-`POST /workouts`, `GET /workouts`) was run against a fresh row to confirm the stack still works
-end-to-end post-cleanup; that smoke-test row was then deleted. Stack torn down
-(`docker compose down`) at the end; volume preserved.
+**Docker status:** Verified the README's own quick-start instructions from a clean state:
+`docker compose down` → `docker compose up -d --build` → `curl /health` → `200`. Also used the live
+Docker API (with a temporary `readme-user`) to capture every real request/response example that
+appears in `README.md` and `VIDEO_WALKTHROUGH.md` — `POST /workouts` (kg + lb), `GET /workouts`
+(base case, partial search, unit conversion, muscle-group filter, real page-2 pagination via an
+actual returned cursor), `GET /workouts/prs` (kg and lb), `GET /workouts/prs/compare`, a malformed
+cursor (400), an unsupported unit (400), an impossible date (400). That temporary data was deleted
+via `psql` immediately after capture. Stack torn down (`docker compose down`) at the end; volume
+preserved.
 
-**Database status:** Postgres volume preserved. The perf dataset (`perf-user`/`perf-user-2`, ~50.2k
-entries) was generated, measured, and then fully removed (`npm run perf:clean`, verified via direct
-`psql` count = 0). Note for future sessions: **the regression suite's test cleanup is unscoped**
-(`prisma.workoutEntry.deleteMany()`/`workoutSet.deleteMany()` with no `where`, in every e2e/
-integration spec's `beforeEach`) — running `npm test:integration`/`npm run test:e2e` while any perf
-or manual-verification data exists will silently delete it. Any previous checkpoints' leftover
-dev/manual-verification data (e.g. `log-user`) no longer exists as of this session, wiped as a side
-effect of this step's regression-suite runs — harmless (dev-only data), but noted here so it isn't
-mistaken for a fresh loss.
+**Database status:** Postgres volume preserved, empty of app data as of this checkpoint (the
+Step 12 perf dataset was already cleaned before this session; this session's own `readme-user`
+verification rows were deleted immediately after capturing real API examples).
 
-**Latest commit:** `a043d03` — `chore: add structured request logging`. This session's work
-(Step 12: `scripts/`, `docs/PERFORMANCE_NOTES.md`, `package.json` script additions, this
-`AI_WORKFLOW.md` update) is uncommitted as of this checkpoint — see "Working tree status" below.
+**Latest commit:** `26c63ab` — `docs: record Step 12 AI interactions and session handoff in
+AI_WORKFLOW.md`. This session's work (Step 13: `README.md`, `docs/ARCHITECTURE.md`,
+`docs/CLARIFICATIONS.md`, `docs/IMPLEMENTATION_PLAN.md`, this `AI_WORKFLOW.md` update) is
+uncommitted as of this checkpoint — see "Working tree status" below.
 
 **Working tree status:** Uncommitted at this checkpoint:
-- Modified: `package.json` (adds `perf:seed`/`perf:clean`/`perf:explain` scripts)
-- New: `scripts/seed-scale-test.ts`, `scripts/clean-scale-test.ts`, `scripts/explain-queries.ts`
-- New: `docs/PERFORMANCE_NOTES.md`
+- New: `README.md`
+- Modified: `docs/ARCHITECTURE.md`, `docs/CLARIFICATIONS.md`, `docs/IMPLEMENTATION_PLAN.md`
 - Modified: `AI_WORKFLOW.md` (this update)
+- **Not tracked, not staged, excluded via `.git/info/exclude`** (confirmed absent from
+  `git status` output): `VIDEO_WALKTHROUGH.md` — private recording prep, not a submission
+  deliverable, per explicit instruction not to commit it without further approval.
 
-Plan: one implementation commit for the `scripts/`/`package.json`/`docs/PERFORMANCE_NOTES.md`
-changes (e.g. `perf: verify query performance at 50k workout entries`), then a separate
-`AI_WORKFLOW.md` commit, per this project's established convention. No generated dataset files are
-being committed — the perf dataset lives only in the local Postgres volume, generated on demand.
+Plan: one commit for the submission-facing documentation (`README.md` +
+`docs/ARCHITECTURE.md`/`CLARIFICATIONS.md`/`IMPLEMENTATION_PLAN.md`), then a separate
+`AI_WORKFLOW.md` commit, per this project's established convention.
 
-**Known issues:** Unchanged from the Step 11 checkpoint (transitive `npm audit` advisories in
+**Known issues:** Unchanged from the Step 12 checkpoint (transitive `npm audit` advisories in
 unreachable code paths; host port 5432→5433 remap; `--runInBand` on the integration/e2e npm
-scripts; Node >=22.12 requirement) **plus one new, real, non-blocking observation**: the
-regression suite's unscoped test-cleanup `deleteMany()` calls (see "Database status" above) mean
-perf/manual-verification data and the automated test suites cannot coexist in the same Postgres
-instance across a test run — not a bug in the shipped application (test cleanup code is not
-production code), but a real operational note for anyone running this workflow again.
+scripts; Node >=22.12 requirement; the regression suite's unscoped test-cleanup `deleteMany()`
+calls mean perf/manual-verification data and the automated test suites cannot coexist in the same
+Postgres instance across a test run). No new issues introduced by documentation changes.
 
 **Unresolved decisions:** None blocking.
 
-**Outstanding assignment requirement:** unchanged — the genuine rejected-AI-suggestion requirement
-is still treated as satisfied only by the one real Step 0 example. No genuine rejection occurred
-this checkpoint; none was invented.
+**Outstanding assignment requirement:** the genuine rejected-AI-suggestion requirement is
+satisfied by the one real Step 0 example — explicitly re-checked this step against all four
+required elements (concrete suggestion, explicit rejection, stated reason, chosen alternative +
+trade-off) and confirmed genuine, not just asserted; see "Submission summary" near the top of this
+file. No second rejection occurred this checkpoint; none was invented.
 
-**Architecture deviations:**
-1. (Carried forward) Step 4's flat conversion-factor registry vs. `ARCHITECTURE.md` §12's
-   per-class description — to reconcile at the README step.
-2. (Carried forward) `POST /workouts`'s full-entry response shape, not specified in
-   `ARCHITECTURE.md` — to reconcile at the README step.
-3. (Carried forward) Step 8 used Prisma's query builder instead of `ARCHITECTURE.md` §6/§8's
-   raw-SQL framing for trigram search and keyset pagination — to reconcile at the README step.
-4. (Carried forward, not really a deviation) Step 9's raw-SQL PR query matches `ARCHITECTURE.md`
-   §5.3 closely — the step where raw SQL turned out correct and necessary, the mirror image of #3.
-5. (Carried forward, not really a deviation) Step 10's route matches `ARCHITECTURE.md` §1's
-   original sketch exactly.
-6. (Carried forward) Node runtime requirement >=22.12, Dockerfile base `node:22-slim` — a real,
-   externally-imposed requirement (nestjs-pino v5), not a design choice revisited; to document in
-   the README's setup/requirements section.
-7. (New, confirms rather than deviates) `ARCHITECTURE.md` §5.2's PR-query cost model — "cost is
-   proportional to candidate-set size, not O(1)" — is now backed by real `EXPLAIN ANALYZE` evidence
-   (§10 of `docs/PERFORMANCE_NOTES.md`), not just stated as a corrected assumption. No architecture
-   change; the previously "unverified" flag on this claim can be removed at the README step.
+**Architecture deviations:** All previously carried-forward items (flat unit-conversion registry,
+`POST /workouts` response shape, Prisma-builder history query, Node runtime bump) were reconciled
+into `docs/ARCHITECTURE.md` this step — see that document's §6, §8, §9, §12, §13, and its closing
+"Open items carried forward" section for the actual current text. Nothing remains flagged as "to
+reconcile at the README step," since that step is this one. Two new items were documented as
+genuine, checked findings rather than deviations: the PR-query candidate-set-proportional cost
+model is now backed by real evidence (§5.2), and the deep-cursor-pagination cost-grows-with-depth
+characteristic discovered in Step 12 is recorded as a known, not-yet-a-problem characteristic
+(§8).
 
-**Exact next implementation step:** `docs/IMPLEMENTATION_PLAN.md` **Step 13 — README finalization
-and video walkthrough**, per the plan's own scope (not started — this session was explicitly scoped
-to Step 12 only, with an explicit instruction not to begin Step 13). The carried-forward
-architecture deviations above (items 1–3, 7) are all flagged as "reconcile/document at the README
-step," so Step 13 should address each of them explicitly rather than leaving them as open items.
+**Exact next implementation step:** `docs/IMPLEMENTATION_PLAN.md` **Step 14 — Final adversarial
+self-review + cleanup**, per the plan's own scope (not started — this session was explicitly
+scoped to Step 13 only, with an explicit instruction not to begin Step 14). Per the plan, this
+step should look specifically for incorrect calculations, timezone bugs, weak validation,
+inconsistent errors, inefficient queries, missing indexes, race conditions, bad pagination,
+precision bugs, untested paths, dead code, and undocumented assumptions — fixing blockers/important
+items and documenting nice-to-haves as future work rather than scope-creeping them in.
 
-**Files/modules likely to be touched next:** `README.md` (new or substantially rewritten),
-`VIDEO_WALKTHROUGH.md`, and possibly a short `docs/ARCHITECTURE.md` addendum noting which
-previously-flagged "unverified" performance claims are now confirmed by `docs/PERFORMANCE_NOTES.md`.
+**Files/modules likely to be touched next:** `docs/FINAL_REVIEW.md` (new), plus whatever specific
+files a real finding from that review touches — not predictable in advance, by design (the point
+of Step 14 is to find real issues, not confirm a pre-written list).
