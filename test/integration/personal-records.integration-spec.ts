@@ -67,6 +67,22 @@ describe('PersonalRecordsRepository (integration)', () => {
     );
   }
 
+  function candidatesInRange(
+    from: string,
+    to: string,
+    userId = 'user-1',
+    exerciseName = 'Bench Press',
+  ) {
+    return repository.findCandidates(
+      userId,
+      normalizeExerciseName(exerciseName),
+      {
+        from: new Date(from),
+        to: new Date(to),
+      },
+    );
+  }
+
   it('picks the highest canonical weight as the heaviest set', async () => {
     await seedSet({
       date: '2026-09-01',
@@ -311,5 +327,232 @@ describe('PersonalRecordsRepository (integration)', () => {
 
     expect(weightWinner?.id).toBe(larger.id.toString());
     expect(Number(weightWinner?.weightKg)).toBeCloseTo(100.0049, 4);
+  });
+
+  describe('findCandidates with a date range (Step 10 support)', () => {
+    it('selects different winners for two non-adjacent ranges with a gap between them', async () => {
+      // "Current" range: Sep 1-30
+      await seedSet({
+        date: '2026-09-05',
+        reps: 5,
+        weight: '120',
+        unit: 'kg',
+        weightKg: '120',
+      });
+      // "Previous" range: Aug 1-31 (gap between Aug 31 and Sep 1)
+      await seedSet({
+        date: '2026-08-10',
+        reps: 5,
+        weight: '100',
+        unit: 'kg',
+        weightKg: '100',
+      });
+
+      const current = await candidatesInRange('2026-09-01', '2026-09-30');
+      const previous = await candidatesInRange('2026-08-01', '2026-08-31');
+
+      expect(Number(current.find((r) => r.rnWeight === 1)?.weightKg)).toBe(120);
+      expect(Number(previous.find((r) => r.rnWeight === 1)?.weightKg)).toBe(
+        100,
+      );
+    });
+
+    it('applies inclusive range boundaries', async () => {
+      await seedSet({
+        date: '2026-09-01',
+        reps: 5,
+        weight: '90',
+        unit: 'kg',
+        weightKg: '90',
+      }); // on lower boundary
+      await seedSet({
+        date: '2026-09-30',
+        reps: 5,
+        weight: '95',
+        unit: 'kg',
+        weightKg: '95',
+      }); // on upper boundary
+      await seedSet({
+        date: '2026-08-31',
+        reps: 5,
+        weight: '999',
+        unit: 'kg',
+        weightKg: '999',
+      }); // just outside
+      await seedSet({
+        date: '2026-10-01',
+        reps: 5,
+        weight: '999',
+        unit: 'kg',
+        weightKg: '999',
+      }); // just outside
+
+      const rows = await candidatesInRange('2026-09-01', '2026-09-30');
+      const weightWinner = rows.find((r) => r.rnWeight === 1);
+
+      // The heaviest set that falls *within* the inclusive range is 95, not
+      // the 999kg sets just outside either boundary.
+      expect(Number(weightWinner?.weightKg)).toBe(95);
+    });
+
+    it('includes both sets in overlapping ranges', async () => {
+      const overlapping = await seedSet({
+        date: '2026-09-15',
+        reps: 5,
+        weight: '130',
+        unit: 'kg',
+        weightKg: '130',
+      });
+
+      const rangeA = await candidatesInRange('2026-09-01', '2026-09-20');
+      const rangeB = await candidatesInRange('2026-09-10', '2026-09-30');
+
+      expect(rangeA.find((r) => r.rnWeight === 1)?.id).toBe(
+        overlapping.id.toString(),
+      );
+      expect(rangeB.find((r) => r.rnWeight === 1)?.id).toBe(
+        overlapping.id.toString(),
+      );
+    });
+
+    it('ranks correctly across mixed kg/lb data within a range', async () => {
+      await seedSet({
+        date: '2026-09-01',
+        reps: 5,
+        weight: '220',
+        unit: 'lb',
+        weightKg: '99.7903',
+      });
+      await seedSet({
+        date: '2026-09-02',
+        reps: 5,
+        weight: '90',
+        unit: 'kg',
+        weightKg: '90',
+      });
+
+      const rows = await candidatesInRange('2026-09-01', '2026-09-30');
+      const weightWinner = rows.find((r) => r.rnWeight === 1);
+
+      expect(Number(weightWinner?.weightKg)).toBeCloseTo(99.7903, 4);
+    });
+
+    it('preserves deterministic tie-breaking within a range', async () => {
+      const earlier = await seedSet({
+        date: '2026-09-01',
+        reps: 5,
+        weight: '100',
+        unit: 'kg',
+        weightKg: '100',
+      });
+      await seedSet({
+        date: '2026-09-15',
+        reps: 5,
+        weight: '100',
+        unit: 'kg',
+        weightKg: '100',
+      });
+
+      const rows = await candidatesInRange('2026-09-01', '2026-09-30');
+      const weightWinner = rows.find((r) => r.rnWeight === 1);
+
+      expect(weightWinner?.id).toBe(earlier.id.toString());
+    });
+
+    it('still enforces user isolation within a range', async () => {
+      await seedSet({
+        userId: 'user-1',
+        date: '2026-09-01',
+        reps: 5,
+        weight: '100',
+        unit: 'kg',
+        weightKg: '100',
+      });
+      await seedSet({
+        userId: 'user-2',
+        date: '2026-09-01',
+        reps: 5,
+        weight: '999',
+        unit: 'kg',
+        weightKg: '999',
+      });
+
+      const rows = await candidatesInRange(
+        '2026-09-01',
+        '2026-09-30',
+        'user-1',
+      );
+      expect(Number(rows.find((r) => r.rnWeight === 1)?.weightKg)).toBe(100);
+    });
+
+    it('still enforces exercise isolation within a range', async () => {
+      await seedSet({
+        exerciseName: 'Bench Press',
+        date: '2026-09-01',
+        reps: 5,
+        weight: '100',
+        unit: 'kg',
+        weightKg: '100',
+      });
+      await seedSet({
+        exerciseName: 'Deadlift',
+        date: '2026-09-01',
+        reps: 5,
+        weight: '999',
+        unit: 'kg',
+        weightKg: '999',
+      });
+
+      const rows = await candidatesInRange(
+        '2026-09-01',
+        '2026-09-30',
+        'user-1',
+        'Bench Press',
+      );
+      expect(Number(rows.find((r) => r.rnWeight === 1)?.weightKg)).toBe(100);
+    });
+
+    it('returns no candidates for a range with no data', async () => {
+      await seedSet({
+        date: '2026-05-01',
+        reps: 5,
+        weight: '100',
+        unit: 'kg',
+        weightKg: '100',
+      });
+
+      const rows = await candidatesInRange('2026-09-01', '2026-09-30');
+      expect(rows).toEqual([]);
+    });
+
+    it('returns no candidates for either of two ranges when both are empty', async () => {
+      const current = await candidatesInRange('2026-09-01', '2026-09-30');
+      const previous = await candidatesInRange('2026-08-01', '2026-08-31');
+
+      expect(current).toEqual([]);
+      expect(previous).toEqual([]);
+    });
+
+    it('uses full NUMERIC(10,4) precision for ranking within a range', async () => {
+      const larger = await seedSet({
+        date: '2026-09-02',
+        reps: 5,
+        weight: '100.0049',
+        unit: 'kg',
+        weightKg: '100.0049',
+      });
+      await seedSet({
+        date: '2026-09-01',
+        reps: 5,
+        weight: '100.0012',
+        unit: 'kg',
+        weightKg: '100.0012',
+      });
+
+      const rows = await candidatesInRange('2026-09-01', '2026-09-30');
+      const weightWinner = rows.find((r) => r.rnWeight === 1);
+
+      expect(weightWinner?.id).toBe(larger.id.toString());
+    });
   });
 });

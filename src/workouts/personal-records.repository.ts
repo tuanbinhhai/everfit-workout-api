@@ -1,4 +1,5 @@
 import { Injectable } from '@nestjs/common';
+import { Prisma } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 
 export interface PrCandidateRow {
@@ -11,6 +12,11 @@ export interface PrCandidateRow {
   rn1Rm: number;
 }
 
+export interface PrDateRange {
+  from: Date;
+  to: Date;
+}
+
 @Injectable()
 export class PersonalRecordsRepository {
   constructor(private readonly prisma: PrismaService) {}
@@ -19,8 +25,8 @@ export class PersonalRecordsRepository {
   // equivalent of ROW_NUMBER() OVER (...), which is what makes this ranking
   // query genuinely need raw SQL — unlike Step 8's filters/joins, which
   // Prisma's builder expressed directly. $queryRaw's tagged template
-  // parameterizes ${userId}/${exerciseNameNormalized} safely by
-  // construction (not string concatenation).
+  // parameterizes ${userId}/${exerciseNameNormalized}/range bounds safely
+  // by construction (not string concatenation).
   //
   // Metrics mirror the pure functions in pr-calculations.ts:
   //   volume    = reps * weight_kg             (calculateVolume)
@@ -29,10 +35,19 @@ export class PersonalRecordsRepository {
   // Ranking happens entirely on canonical weight_kg (never original
   // weight/unit), with a fully deterministic tiebreak: metric DESC, then
   // date ASC (earliest achievement wins a tie), then id ASC.
+  //
+  // `range` is optional: omitted for the plain (Step 9) full-history PR
+  // lookup, supplied (inclusive both ends) for Step 10's range comparison —
+  // same query, same ranking semantics, no duplicated ranking logic.
   async findCandidates(
     userId: string,
     exerciseNameNormalized: string,
+    range?: PrDateRange,
   ): Promise<PrCandidateRow[]> {
+    const rangeFilter = range
+      ? Prisma.sql`AND e.date >= ${range.from} AND e.date <= ${range.to}`
+      : Prisma.empty;
+
     return this.prisma.$queryRaw<PrCandidateRow[]>`
       WITH scoped_sets AS (
         SELECT
@@ -47,6 +62,7 @@ export class PersonalRecordsRepository {
         JOIN workout_entries e ON e.id = s.workout_entry_id
         WHERE e.user_id = ${userId}
           AND e.exercise_name_normalized = ${exerciseNameNormalized}
+          ${rangeFilter}
       ),
       ranked AS (
         SELECT

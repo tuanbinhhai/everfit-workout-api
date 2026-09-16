@@ -1,8 +1,10 @@
 import { Body, Controller, Get, Post, Query } from '@nestjs/common';
 import { BulkCreateWorkoutDto } from './dto/bulk-create-workout.dto';
+import { PersonalRecordsCompareQueryDto } from './dto/personal-records-compare-query.dto';
 import { PersonalRecordsQueryDto } from './dto/personal-records-query.dto';
 import { WorkoutHistoryQueryDto } from './dto/workout-history-query.dto';
 import {
+  PersonalRecordsCompareResult,
   PersonalRecordsResult,
   PersonalRecordsService,
 } from './personal-records.service';
@@ -38,5 +40,12 @@ export class WorkoutsController {
     @Query() query: PersonalRecordsQueryDto,
   ): Promise<PersonalRecordsResult> {
     return this.personalRecordsService.getPersonalRecords(query);
+  }
+
+  @Get('prs/compare')
+  async comparePersonalRecords(
+    @Query() query: PersonalRecordsCompareQueryDto,
+  ): Promise<PersonalRecordsCompareResult> {
+    return this.personalRecordsService.comparePersonalRecords(query);
   }
 }
