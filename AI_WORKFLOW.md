@@ -102,6 +102,7 @@ correction happens inline, in conversation, before code is accepted.
 | 16 | Step 11 — structured request logging | Explicit library preference (nestjs-pino/pino-http unless a concrete reason not to), explicit field/sensitivity constraints | Read nestjs-pino's actual README/type definitions before writing any code (not assumed from training knowledge) — this is what surfaced the Node >=22.12 requirement and the exact `genReqId`/serializer API shape; custom req/res serializers reduced to `{id, method, url}`/`{statusCode}` only | Matched the requested design; caught and fixed a real gap myself before it reached commit — see "AI mistakes" below | Committed (`a043d03`); 112 unit / 44 integration / 64 e2e, Docker rebuilt on the now-required Node 22 base image and manually verified incl. a real DB-outage-triggered 500 (not a fake endpoint) |
 | 17 | Step 12 — performance verification at 50k+ entries | Explicit instruction: real Postgres, real `EXPLAIN (ANALYZE, BUFFERS)`, deterministic batch-inserted seed data (no HTTP one-at-a-time inserts), capture the *actual* SQL Prisma sends rather than hand-reconstructing it, don't assume the trigram index is used — verify | `scripts/seed-scale-test.ts` (deterministic index-arithmetic generator, worst-case 40%-concentration exercise), `scripts/explain-queries.ts` (Prisma query-event capture + re-run under `EXPLAIN`), `docs/PERFORMANCE_NOTES.md` | Matched the requested design; found and fixed three real bugs in the benchmark tooling itself via actual execution, not review — see "AI mistakes" below. Confirmed (not assumed) that the trigram GIN index is used for the PR query's equality lookup but *not* for `findHistory`'s substring search at this data shape, and confirmed the PR query's cost scales with candidate-set size as `ARCHITECTURE.md` §5.2 predicted | 220 unit/integration/e2e tests still pass unmodified (no query/schema change was evidence-justified), lint/build/prettier clean, Docker-verified with real curl + psql; perf dataset generated, measured, and cleaned per the documented commands |
 | 18 | Step 13 — documentation finalization | Explicit instruction: README must describe what the code ACTUALLY does, not restate stale planning docs; verify every API example against real running code, not invented; do not claim pg_trgm is always used for substring search; synchronize `ARCHITECTURE.md` with the real implementation without rewriting historical `AI_WORKFLOW.md` entries | Read every controller/DTO/service/repository/schema/migration/docker-compose file directly (not relied on earlier markdown) before writing `README.md`; ran real `POST`/`GET` requests against the live Docker API for every example in the README and the video script (PR/PR-compare/history/pagination/error responses) rather than reconstructing them from types; updated `ARCHITECTURE.md` §5.2/§6/§7/§8/§9/§12/§13 and the "Open items" close to match measured Step 12 evidence and the actual implemented design (flat unit-conversion factor table, single merged controller, Prisma query builder for history) | Matched the requested scope; no code/behavior change, so no test modification needed — verified by rerunning the full suite anyway | 220 unit/integration/e2e tests unchanged and passing, lint/build/prettier clean, README quick-start manually re-verified against a clean `docker compose down && up --build`, `VIDEO_WALKTHROUGH.md` created and confirmed excluded from `git status` via `.git/info/exclude` |
+| 19 | Step 14 — final adversarial review | Explicit instruction: act as a strict reviewer trying to find concrete reasons to reject the submission; re-read the original assignment PDF directly, not `IMPLEMENTATION_PLAN.md`; build a requirement traceability matrix; do not fabricate fixes for things that genuinely can't be fixed (the time-estimate deliverable) | Read the original assignment PDF fresh (not from memory/summary); ran a genuine clean-room test (`docker compose down -v` → `up -d --build` → query the DB directly) instead of trusting the README's own "migrations applied automatically" claim | Found and fixed a real BLOCKER: migrations were never actually applied automatically — the Dockerfile's `CMD` had no migration step at all, so every DB-touching endpoint 500'd on a fresh volume. Found and fixed 5 more real documentation gaps (undocumented Docker seed step, an `AI_WORKFLOW.md` claim about README that wasn't true, a second real `npm audit` advisory never documented, an imprecise pagination-under-concurrent-inserts claim, an undocumented timezone-handling section despite it being a named assignment requirement) and one real inconsistency in the video script (a code snippet silently missing one line). Explicitly did **not** fabricate a fix for the missing time-estimate deliverable — flagged it honestly instead, since providing one retroactively at this point would misrepresent the record | `docs/FINAL_REVIEW.md` created with the full requirement traceability matrix; fresh clean-room Docker test (down -v → up --build) confirmed the migration fix works from an empty volume and is idempotent on restart; full regression suite (112/44/64), lint, build, prettier all re-verified green after every fix |
 
 ---
 
@@ -451,6 +452,20 @@ This app has no file-upload endpoints and never wires up `multer`'s interceptors
 vulnerable code path is not reachable — documented here and in the README as an accepted,
 non-exploitable transitive advisory rather than silently ignored.
 
+**Second trade-off, found during Step 14's dependency review (not caught earlier — recorded
+honestly rather than backfilled as if always known):** `prisma@7.10.0`'s own `@prisma/config`
+dependency pulls in `mysql2`/`deepmerge-ts`, both flagged by `npm audit` for MySQL-protocol-related
+advisories. This app never connects to MySQL — it exclusively uses `@prisma/adapter-pg` — so, like
+the `multer` case, the vulnerable code path exists on disk but is never invoked by this
+application's request-handling code. `prisma` (the CLI, not just `@prisma/client`) is deliberately
+a `dependencies` entry rather than `devDependencies`: the Docker runtime stage's `npm ci --omit=dev`
+still needs the `prisma` binary present so its `postinstall` hook (`prisma generate`) and the
+runtime `CMD`'s `prisma migrate deploy` step both work — moving it to `devDependencies` would break
+the container's own migration-on-startup behavior (see Step 14's Docker blocker fix). `npm audit
+fix --force` was deliberately not run — it would downgrade to `prisma@6.19.3`, a breaking change to
+the exact driver-adapter/`prisma-client` generator architecture this whole project is built on, for
+an advisory in code this app never executes.
+
 ---
 
 ## Human review
@@ -615,7 +630,8 @@ This section will keep growing as later implementation steps land.
 Session 2 (09-15, continuation): Steps 3–4. Session 3 (09-15, continuation): Steps 5–7 + end-of-day
 closeout. Session 4 (09-16): context restored and re-verified, then Steps 8–11. Session 5 (09-16,
 continuation): Step 12 (performance verification). Session 6 (09-16, continuation): Step 13
-(documentation finalization).
+(documentation finalization). Session 7 (09-16, continuation): Step 14 (final adversarial review) —
+**submission-ready as of this checkpoint, with one flagged exception (see below).**
 
 **Completed implementation steps** (of `docs/IMPLEMENTATION_PLAN.md`'s 15 steps):
 - Step 0 — NestJS bootstrap + tooling. Commit `4bb235b`.
@@ -645,91 +661,96 @@ continuation): Step 12 (performance verification). Session 6 (09-16, continuatio
   history query, the two Step 12 corrections to the trigram-index and PR-cost claims, deep-cursor
   pagination finding), historical-document banners added to `docs/CLARIFICATIONS.md` and
   `docs/IMPLEMENTATION_PLAN.md` (left otherwise unrewritten), a "Submission summary" index added
-  near the top of this file, and `VIDEO_WALKTHROUGH.md` (private, not committed — see "Working tree
-  status" below). No application code changed. Commit pending (this checkpoint).
+  near the top of this file, and `VIDEO_WALKTHROUGH.md` (private, not committed). Commit `a791cd6`.
+- Step 14 — Final adversarial review: re-read the original assignment PDF directly, built a full
+  requirement traceability matrix (`docs/FINAL_REVIEW.md`), and found/fixed one real **BLOCKER**
+  (Docker's runtime image never actually ran migrations, despite the README claiming it did — a
+  fresh-volume `docker compose up` left every DB-touching endpoint returning `500`) plus five real
+  documentation gaps and one video-script inconsistency. One genuine unresolved item was flagged,
+  not fabricated: the assignment's "time estimate before starting" deliverable was never actually
+  recorded anywhere in this repo. Commit pending (this checkpoint).
 
 Plus Phase 1–4 planning docs (`b673004`) and the `AI_WORKFLOW.md` handoff updates (`eb6e761`,
-`344d989`, `0f2ef49`, `d110c96`, `0e46962`, `073b44c`, `613589f`, `e7b8888`, `26c63ab`).
+`344d989`, `0f2ef49`, `d110c96`, `0e46962`, `073b44c`, `613589f`, `e7b8888`, `26c63ab`, `a5ee514`).
 
-**Current implementation state:** Steps 0–13 fully implemented/documented and verified for real.
-Step 14 (final adversarial self-review) has **not** been started.
+**Current implementation state:** Steps 0–14 complete. This is the final checkpoint of the
+implementation plan — no further steps remain in `docs/IMPLEMENTATION_PLAN.md`.
 
-**Tests currently passing/failing:** Unchanged in count from the Step 12 checkpoint — Step 13 is
-documentation-only, no application code changed.
+**Tests currently passing/failing:** Unchanged in count from the Step 12/13 checkpoints — Step 14
+found no correctness bug requiring a code/test change (the one BLOCKER found was a Docker/deployment
+gap, not an application-logic bug).
 - Unit (`npm test`): **112/112 passing**.
 - Integration (`npm run test:integration`, real Postgres, `--runInBand`): **44/44 passing**.
 - E2E (`npm run test:e2e`, real Postgres, `--runInBand`): **64/64 passing**.
-- Re-run in full after all documentation changes landed, specifically to confirm nothing
-  behavioral had changed — same 112/44/64 result.
+- Re-run in full after every fix this step (the `Dockerfile` change, and each documentation
+  correction), confirming the same 112/44/64 result throughout.
 
 **Build/lint/format status:**
 - `npm run build`: clean, `dist/main.js` at the correct path.
 - `npm run lint`: 0 errors, 0 warnings.
-- `npx prettier --check` (`src`, `test`): clean.
+- `npx prettier --check` (`src`, `test`, `scripts`): clean.
 
-**Docker status:** Verified the README's own quick-start instructions from a clean state:
-`docker compose down` → `docker compose up -d --build` → `curl /health` → `200`. Also used the live
-Docker API (with a temporary `readme-user`) to capture every real request/response example that
-appears in `README.md` and `VIDEO_WALKTHROUGH.md` — `POST /workouts` (kg + lb), `GET /workouts`
-(base case, partial search, unit conversion, muscle-group filter, real page-2 pagination via an
-actual returned cursor), `GET /workouts/prs` (kg and lb), `GET /workouts/prs/compare`, a malformed
-cursor (400), an unsupported unit (400), an impossible date (400). That temporary data was deleted
-via `psql` immediately after capture. Stack torn down (`docker compose down`) at the end; volume
-preserved.
+**Docker status:** A genuine clean-room test was run this step: `docker compose down -v` (volume
+included — the data was disposable dev/test data, already established as non-precious throughout
+this project) → `docker compose up -d --build` → verified the database had **zero tables**, and a
+real endpoint returned `500` — the BLOCKER described above, caught by testing, not by reading the
+Dockerfile and assuming it worked. Fixed (`Dockerfile`'s runtime `CMD` now runs
+`prisma migrate deploy` before starting the app; `prisma.config.ts` now also copied into the
+runtime stage, since it supplies the datasource URL that step needs). Re-verified from another
+fresh `down -v` → `up --build`: tables exist, full API smoke sequence (health, POST, history, PRs,
+compare) all pass, full regression suite passes against the Docker Postgres, and a plain container
+**restart** (no volume reset) is idempotent — `prisma migrate deploy` correctly no-ops when nothing
+is pending. Stack torn down (`docker compose down`, volume preserved) at the end.
 
-**Database status:** Postgres volume preserved, empty of app data as of this checkpoint (the
-Step 12 perf dataset was already cleaned before this session; this session's own `readme-user`
-verification rows were deleted immediately after capturing real API examples).
+**Database status:** Postgres volume preserved, empty of app data as of this checkpoint (all
+review-session test data was either deleted directly via `psql` after use, or wiped by the
+regression suite's own unscoped cleanup — both already-established, documented behaviors).
 
-**Latest commit:** `26c63ab` — `docs: record Step 12 AI interactions and session handoff in
-AI_WORKFLOW.md`. This session's work (Step 13: `README.md`, `docs/ARCHITECTURE.md`,
-`docs/CLARIFICATIONS.md`, `docs/IMPLEMENTATION_PLAN.md`, this `AI_WORKFLOW.md` update) is
-uncommitted as of this checkpoint — see "Working tree status" below.
+**Latest commit:** `a5ee514` — `docs: record Step 13 AI interactions and session handoff in
+AI_WORKFLOW.md`. This session's work (Step 14: `Dockerfile`, `README.md` additions,
+`AI_WORKFLOW.md` additions, `docs/FINAL_REVIEW.md`, this handoff update) is uncommitted as of this
+checkpoint — see "Working tree status" below.
 
 **Working tree status:** Uncommitted at this checkpoint:
-- New: `README.md`
-- Modified: `docs/ARCHITECTURE.md`, `docs/CLARIFICATIONS.md`, `docs/IMPLEMENTATION_PLAN.md`
-- Modified: `AI_WORKFLOW.md` (this update)
-- **Not tracked, not staged, excluded via `.git/info/exclude`** (confirmed absent from
-  `git status` output): `VIDEO_WALKTHROUGH.md` — private recording prep, not a submission
-  deliverable, per explicit instruction not to commit it without further approval.
+- Modified: `Dockerfile` (the BLOCKER fix — migration-on-startup)
+- Modified: `README.md` (Docker seed step, Known Dependency Advisories, pagination-under-
+  concurrent-inserts precision, Timezone Handling section)
+- Modified: `AI_WORKFLOW.md` (this update; second dependency-advisory trade-off note; Step 14
+  interaction log entry)
+- New: `docs/FINAL_REVIEW.md`
+- (Not part of this repo's git history, by design) `VIDEO_WALKTHROUGH.md` updated locally (one
+  code-snippet line restored for accuracy) — confirmed still absent from `git status` /
+  `git ls-files`.
 
-Plan: one commit for the submission-facing documentation (`README.md` +
-`docs/ARCHITECTURE.md`/`CLARIFICATIONS.md`/`IMPLEMENTATION_PLAN.md`), then a separate
-`AI_WORKFLOW.md` commit, per this project's established convention.
+Plan: one commit for the fix + documentation (`Dockerfile`, `README.md`, `docs/FINAL_REVIEW.md`),
+then a separate `AI_WORKFLOW.md` commit, per this project's established convention.
 
-**Known issues:** Unchanged from the Step 12 checkpoint (transitive `npm audit` advisories in
-unreachable code paths; host port 5432→5433 remap; `--runInBand` on the integration/e2e npm
+**Known issues:** Unchanged from the Step 13 checkpoint (transitive `npm audit` advisories in
+unreachable code paths — now **more completely documented**, including the newly-found
+`mysql2`/`deepmerge-ts` chain; host port 5432→5433 remap; `--runInBand` on the integration/e2e npm
 scripts; Node >=22.12 requirement; the regression suite's unscoped test-cleanup `deleteMany()`
-calls mean perf/manual-verification data and the automated test suites cannot coexist in the same
-Postgres instance across a test run). No new issues introduced by documentation changes.
+calls). **One new, real, unresolved item, honestly flagged rather than silently ignored or
+fabricated around:** the assignment's "time estimate provided before starting" deliverable was
+never actually recorded anywhere in this repository — see `docs/FINAL_REVIEW.md` §2 for the full
+explanation of why this can't be retroactively fixed in good faith.
 
-**Unresolved decisions:** None blocking.
+**Unresolved decisions:** None blocking implementation. The time-estimate deliverable gap requires
+the repository owner's own input (see above) — not something further AI work in this repo can
+resolve.
 
-**Outstanding assignment requirement:** the genuine rejected-AI-suggestion requirement is
-satisfied by the one real Step 0 example — explicitly re-checked this step against all four
-required elements (concrete suggestion, explicit rejection, stated reason, chosen alternative +
-trade-off) and confirmed genuine, not just asserted; see "Submission summary" near the top of this
-file. No second rejection occurred this checkpoint; none was invented.
+**Outstanding assignment requirement:** the genuine rejected-AI-suggestion requirement remains
+satisfied by the one real Step 0 example, re-verified again this step against all four required
+elements. No fabrication occurred this checkpoint.
 
-**Architecture deviations:** All previously carried-forward items (flat unit-conversion registry,
-`POST /workouts` response shape, Prisma-builder history query, Node runtime bump) were reconciled
-into `docs/ARCHITECTURE.md` this step — see that document's §6, §8, §9, §12, §13, and its closing
-"Open items carried forward" section for the actual current text. Nothing remains flagged as "to
-reconcile at the README step," since that step is this one. Two new items were documented as
-genuine, checked findings rather than deviations: the PR-query candidate-set-proportional cost
-model is now backed by real evidence (§5.2), and the deep-cursor-pagination cost-grows-with-depth
-characteristic discovered in Step 12 is recorded as a known, not-yet-a-problem characteristic
-(§8).
+**Architecture deviations:** none new this step — Step 14 found no design-level issue requiring an
+architecture change, only a deployment-configuration gap (Docker) and documentation-completeness
+gaps (see `docs/FINAL_REVIEW.md` §2 for the full list, all fixed except the time-estimate item).
 
-**Exact next implementation step:** `docs/IMPLEMENTATION_PLAN.md` **Step 14 — Final adversarial
-self-review + cleanup**, per the plan's own scope (not started — this session was explicitly
-scoped to Step 13 only, with an explicit instruction not to begin Step 14). Per the plan, this
-step should look specifically for incorrect calculations, timezone bugs, weak validation,
-inconsistent errors, inefficient queries, missing indexes, race conditions, bad pagination,
-precision bugs, untested paths, dead code, and undocumented assumptions — fixing blockers/important
-items and documenting nice-to-haves as future work rather than scope-creeping them in.
+**Exact next implementation step:** none remaining in `docs/IMPLEMENTATION_PLAN.md` — Steps 0–14
+are all complete. Any further work is the repository owner's own (recording the actual video per
+`VIDEO_WALKTHROUGH.md`, and resolving the time-estimate gap), not a numbered implementation step.
 
-**Files/modules likely to be touched next:** `docs/FINAL_REVIEW.md` (new), plus whatever specific
-files a real finding from that review touches — not predictable in advance, by design (the point
-of Step 14 is to find real issues, not confirm a pre-written list).
+**Files/modules likely to be touched next:** none anticipated by this plan. If the repository
+owner records the video and wants transcript/timing adjustments reflected back into
+`VIDEO_WALKTHROUGH.md`, that would be the most likely next touch — still private, still not
+committed unless explicitly requested.
