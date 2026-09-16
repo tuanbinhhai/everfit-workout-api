@@ -62,6 +62,7 @@ correction happens inline, in conversation, before code is accepted.
 | 11 | Step 6 — workout DTOs | Explicit requirement: reject impossible dates, not just regex-shaped ones; keep unit-support checking out of DTOs | `IsCalendarDate` custom validator (regex + `Date.UTC` round-trip to catch e.g. `2026-02-30`), `exerciseName` trimmed via `class-transformer` before `@IsNotEmpty()` | Matched the requested shape directly | Committed (`05a8cbb`) |
 | 12 | Step 7 — POST /workouts | Explicit repository responsibility split (batch inserts, one transaction, no business logic) | `createManyAndReturn` for both entries and sets (real multi-row `INSERT...RETURNING`, not N individual inserts), transaction rollback verified against real Postgres | Matched the requested shape; caught and fixed my own test-expectation bug (see "AI mistakes" below) via the integration run, not code review alone | Committed (`5fedf19`); 47 unit / 10 integration / 23 e2e, Docker-verified with real curl + psql |
 | 13 | Step 8 — GET /workouts history + cursor pagination | Explicit instruction to prefer Prisma's query builder over raw SQL unless there's a concrete benefit, even though ARCHITECTURE.md originally framed these same queries around raw SQL | `contains`/`mode:'insensitive'` for trigram-backed substring search, an `OR`-based keyset predicate for `(date,id) < (cursor.date,cursor.id)`, a second small query to resolve muscleGroup → exercise names (no raw SQL, no schema relation added) | Matched the requested shape; caught two real issues via actual execution, not code review — see "AI mistakes" below | Committed (`859cd5c`); 77 unit / 24 integration / 43 e2e, Docker-verified with real curl + psql incl. real cursor-based pagination |
+| 14 | Step 9 — GET /workouts/prs personal records | Explicit instruction that raw SQL is justified here (unlike Step 8) since Prisma has no `ROW_NUMBER() OVER (...)` equivalent; explicit exact-match (not partial) exercise identity requirement | One windowed `$queryRaw` tagged-template query computing and ranking all three PR metrics in a single round trip, casting NUMERIC/BIGINT columns to text to preserve precision through to JS; two small pure functions (`calculateVolume`, `calculateEpley1Rm`) mirroring the SQL's formulas, unit-tested independently; SQL ranking itself verified only via integration tests, not re-implemented in TS for unit testing | Matched the requested shape and the requested test-layer split (no duplicated ranking logic in TS just to unit-test it) | Committed (`8b18b7d`); 92 unit / 34 integration / 51 e2e, Docker-verified with real curl + psql cross-checking the DB's own raw metric computation against the API's selected winners |
 
 ---
 
@@ -378,6 +379,17 @@ What was personally verified in this session, not just generated and trusted:
   directly to confirm `weight`, `unit`, and `weight_kg` were byte-for-byte unchanged from what was
   originally stored — proving the read path never mutates persisted values, not just asserting it
   in a docstring.
+- **Step 9 commands actually executed**: `npm test` (92/92), `npm run test:integration` (34/34,
+  real Postgres), `npm run test:e2e` (51/51), `npm run lint`, `npx nest build`,
+  `npx prettier --check`, and a full Docker rebuild + 8-item manual verification checklist. No new
+  mistakes or corrections this checkpoint — the raw SQL ranking query, tie-breaking, and
+  canonical-kg selection all worked as designed on the first real test run (92/34/51 all green
+  the first time each suite was executed, not after debugging failures), which is itself recorded
+  here honestly rather than inventing a correction narrative where none occurred.
+- **DB-side computation cross-checked against API output, not assumed consistent**: ran the exact
+  same `epley_1rm`/`volume` arithmetic directly via `psql` against the seeded PR test data and
+  confirmed which rows had the highest values matched exactly which rows the API returned as
+  winners — closing the loop between "the SQL query looks right" and "the SQL query is right."
 
 This section will keep growing as later implementation steps land.
 
@@ -387,7 +399,7 @@ This section will keep growing as later implementation steps land.
 
 **Date / session:** 2026-09-15/16. Session 1 (09-15): Phases 1–4 planning + Steps 0–2.
 Session 2 (09-15, continuation): Steps 3–4. Session 3 (09-15, continuation): Steps 5–7 + end-of-day
-closeout. Session 4 (09-16): context restored and re-verified, then Step 8.
+closeout. Session 4 (09-16): context restored and re-verified, then Steps 8–9.
 
 **Completed implementation steps** (of `docs/IMPLEMENTATION_PLAN.md`'s 15 steps):
 - Step 0 — NestJS bootstrap + tooling. Commit `4bb235b`.
@@ -398,110 +410,99 @@ closeout. Session 4 (09-16): context restored and re-verified, then Step 8.
 - Step 5 — Structured error handling. Commit `05a8cbb` (bundled with Step 6).
 - Step 6 — Workout DTOs. Commit `05a8cbb`.
 - Step 7 — `POST /workouts` atomic bulk logging. Commit `5fedf19`.
-- Step 8 — `GET /workouts` history: filtering (partial exercise name via the existing trigram
-  index, inclusive date range with a cross-field `from<=to` validator, muscle group via an
-  extended `MuscleGroupProvider.listExerciseNames()`), `unit` output conversion (default kg,
-  always computed from canonical `weightKg`, never from the original value, rounded to 2dp at
-  this display boundary per `docs/CLARIFICATIONS.md` #11), and keyset cursor pagination
-  (`date DESC, id DESC`, opaque base64url `{date, id}` cursor, `limit+1` fetch for `hasMore`
-  without `COUNT(*)`). Built with Prisma's query builder throughout, no raw SQL. Commit `859cd5c`.
+- Step 8 — `GET /workouts` history with filtering, unit conversion, cursor pagination. Commit
+  `859cd5c`.
+- Step 9 — `GET /workouts/prs`: heaviest set, highest-volume set (`reps * weightKg`), best
+  estimated 1RM (Epley: `weightKg * (1 + reps/30)`), each with achievement date. One windowed
+  `$queryRaw` query ranks all three metrics in Postgres via `ROW_NUMBER() OVER (metric DESC,
+  date ASC, id ASC)` — the first genuine raw-SQL case in this codebase (Prisma has no window
+  function equivalent), unlike Step 8 where raw SQL turned out unnecessary. Exact (not partial)
+  exercise-name matching. Selection happens entirely in SQL on canonical `weight_kg`; only the
+  1-3 winning rows are converted to the requested unit afterward. `hasData:false` + message for
+  no data, per `docs/CLARIFICATIONS.md` #17. Commit `8b18b7d`.
 
 Plus Phase 1–4 planning docs (`b673004`) and the `AI_WORKFLOW.md` handoff updates (`eb6e761`,
-`344d989`, `0f2ef49`, `d110c96`, `0e46962`).
+`344d989`, `0f2ef49`, `d110c96`, `0e46962`, `073b44c`).
 
-**Current implementation state:** Steps 0–8 fully implemented and verified for real. Step 9
-(Personal Records) has **not** been started — confirmed by inspecting `workouts.controller.ts`
-(only `POST` and the new `GET` history route exist) and `workouts.repository.ts`/`.service.ts`
-(no PR/Epley/1RM logic anywhere).
+**Current implementation state:** Steps 0–9 fully implemented and verified for real. Step 10
+(PR Comparison) has **not** been started — confirmed by inspecting `workouts.controller.ts` (only
+`POST`, `GET`, `GET prs` routes exist) and `personal-records.service.ts` (single-range PR lookup
+only, no comparison/delta logic).
 
 **Tests currently passing/failing:**
-- Unit (`npm test`): **77/77 passing** — adds `cursor.spec.ts` (encode/decode round-trip + all 7
-  documented malformed-cursor cases), `is-on-or-before.validator.spec.ts` (cross-field date-range
-  validation), `PrismaMuscleGroupProvider.listExerciseNames` cases, and a `WorkoutsService.getHistory`
-  suite (filters passed correctly, default/requested unit, conversion-from-canonical-weightKg,
-  nextCursor from the correct last record, hasMore behavior, empty-result message, unsupported
-  unit and malformed cursor both short-circuit before touching the repository).
-- Integration (`npm run test:integration`, real Postgres, **now run with `--runInBand`** — see
-  mistake #6): **24/24 passing** — 3 Step 2 + 10 Step 7 (unchanged) + 11 new `findHistory` tests
-  (user isolation, date/id ordering, inclusive `from`/`to` boundaries, partial + case-insensitive
-  search, muscle-group filtering incl. no-match, combined filters, multi-page pagination with no
-  skipped/duplicated rows across 25 entries, same-date cursor-boundary pagination, empty results,
-  persisted-value invariance verified via a direct `psql`-equivalent `findUniqueOrThrow`).
-- E2E (`npm run test:e2e`, real Postgres via full HTTP stack, **now run with `--runInBand`**):
-  **43/43 passing** — 1 health + 22 `POST /workouts` (unchanged) + 20 new `GET /workouts` tests
-  (10 happy paths, real two-page cursor pagination via the actual returned `nextCursor`, 8
-  validation cases, 1 empty-result case).
+- Unit (`npm test`): **92/92 passing** — adds `pr-calculations.spec.ts` (Epley + volume pure
+  functions: known input, representative decimal input, precision-not-truncated, monotonicity)
+  and `personal-records.service.spec.ts` (candidate-row → response mapping, kg default, lb
+  conversion, no-data shape, normalized-identity passed to repository, unsupported unit skips the
+  repository, and a test proving each of the three PR fields comes from its own correctly-selected
+  winner row rather than a single row or a pre-selection value).
+- Integration (`npm run test:integration`, real Postgres, `--runInBand`): **34/34 passing** — 24
+  from Steps 2/7/8 (unchanged) + 10 new `PersonalRecordsRepository.findCandidates` tests (heaviest
+  weight, volume beating a heavier/low-rep set, three genuinely distinct metric winners from one
+  dataset, mixed kg/lb ranking on canonical weight, both tiebreak levels — date then id, user
+  isolation, exercise isolation, no data, and a precision case where two sets both round to
+  "100.00" at 2dp but must still rank deterministically on their stored 4th decimal).
+- E2E (`npm run test:e2e`, real Postgres, `--runInBand`): **51/51 passing** — 43 from Steps 0/7/8
+  (unchanged) + 8 new `GET /workouts/prs` contract tests (kg default, lb conversion, mixed-unit
+  ranking, three distinct winners with correct dates, no-data shape, missing userId/exerciseName,
+  unsupported unit).
 
 **Build/lint/format status:**
 - `npm run build`: clean, `dist/main.js` at the correct path.
 - `npm run lint`: 0 errors, 0 warnings.
 - `npx prettier --check`: clean.
 
-**Docker status:** Rebuilt and manually verified end-to-end this checkpoint (real runtime
-behavior changed — new endpoint, new DI wiring — so this was done, not skipped). All 10 checklist
-items verified via real `curl`: normal history, partial search, date range, muscle group, lb
-conversion, combined filters, **real** page1→page2 pagination using the actual `nextCursor` value
-returned by the API (not a hand-constructed one), same-date pagination, empty result, malformed
-cursor. This manual pass is what caught mistake #5 (missing display rounding) before it was ever
-committed — the rebuild was redone after the fix and reverified clean. Persisted rows
-cross-checked via `psql` before/after several `unit=lb` reads to confirm no mutation. Stack torn
-down (`docker compose down`) at the end; volume preserved.
+**Docker status:** Rebuilt and manually verified end-to-end this checkpoint. All 8 checklist
+items verified via real `curl`: heaviest set, highest volume, best 1RM, three distinct winners
+from one dataset, mixed kg/lb history (lb-logged set correctly winning over a "rounder" kg
+number), a same-date tie resolved to the earlier-created set, `unit=lb` conversion, and a
+no-data response. Additionally ran the exact `epley_1rm`/`volume` SQL arithmetic directly via
+`psql` against the seeded data and confirmed it matched which rows the API returned as winners —
+closing the loop between the query looking right and being right. Stack torn down
+(`docker compose down`) at the end; volume preserved.
 
-**Database status:** Same Postgres volume as previous checkpoints. Manually-seeded verification
-data from this and the prior checkpoint (`manual-user`, `manual-user2`, `page-user`,
-`sameday-user`, etc.) is left in the dev volume — harmless, dev-only, not cleaned up, consistent
-with how the same trade-off was handled and documented at the Step 7 checkpoint.
+**Database status:** Same Postgres volume as previous checkpoints, now also containing this
+checkpoint's manual-verification data (`pr-user`, `mixed-user`, `tie-user`) — harmless, dev-only,
+left in place per the established practice.
 
-**Latest commit:** `859cd5c` — `feat: add workout history filtering and cursor pagination` (this
+**Latest commit:** `8b18b7d` — `feat: implement personal record calculations` (this
 `AI_WORKFLOW.md` update will be its own commit immediately after being written).
 
-**Working tree status:** Clean prior to this update — verified via `git status` at the start of
-this session (context-restoration check) and again just before this commit.
+**Working tree status:** Clean prior to this update, verified via `git status` before committing.
 
-**Known issues:**
-- Same as previous checkpoints (transitive `npm audit` advisories in unreachable code paths; host
-  port 5432→5433 remap, permanent and documented).
-- **New, fixed this checkpoint, worth remembering going forward:** integration/e2e test files
-  share one live Postgres database and were racing each other under Jest's default parallel-worker
-  execution (mistake #6). Fixed via `--runInBand` on both `test:integration` and `test:e2e` npm
-  scripts. Any future spec file added to either suite is safe by default now (serial execution),
-  but should still avoid assuming exclusive ownership of shared-looking data like `'user-1'` if
-  that assumption ever needs to be relaxed back to parallel execution for speed.
+**Known issues:** Unchanged from the last checkpoint (transitive `npm audit` advisories in
+unreachable code paths; host port 5432→5433 remap, permanent and documented; `--runInBand` on the
+integration/e2e npm scripts, permanent and documented). Nothing new introduced by Step 9.
 
 **Unresolved decisions:** None blocking.
 
 **Outstanding assignment requirement:** unchanged — the genuine rejected-AI-suggestion
-requirement is still being treated as satisfied only by the one real Step-0 example (NestJS CLI
-scaffold defaults), not supplemented further. No genuine rejection occurred this checkpoint either.
+requirement is still treated as satisfied only by the one real Step 0 example. No genuine
+rejection occurred this checkpoint; none was invented.
 
 **Architecture deviations:**
 1. (Carried forward) Step 4's flat conversion-factor registry vs. `ARCHITECTURE.md` §12's
    per-class description — explicitly instructed, to reconcile at the README step.
 2. (Carried forward) `POST /workouts`'s full-entry response shape, not specified in
    `ARCHITECTURE.md` — a reasonable implementation-time choice, to reconcile at the README step.
-3. (New) `ARCHITECTURE.md` §5–§8 originally framed trigram search and keyset pagination around
-   raw SQL; Step 8 was explicitly instructed to prefer Prisma's query builder instead, and it
-   turned out to express both adequately (an `ILIKE`-equivalent `contains` for the trigram-indexed
-   search, an `OR`-based predicate for the keyset comparison) with no raw SQL needed. The
-   underlying index strategy `ARCHITECTURE.md` describes is unchanged and still exactly what's
-   used — only the query-construction *mechanism* differs from the doc's original framing. To
-   reconcile at the README/docs-sync step alongside deviations #1 and #2.
+3. (Carried forward) Step 8 used Prisma's query builder instead of `ARCHITECTURE.md` §6/§8's
+   raw-SQL framing for trigram search and keyset pagination — to reconcile at the README step.
+4. (New, not really a deviation) Step 9's raw-SQL PR query matches `ARCHITECTURE.md` §5.3 almost
+   exactly (the tiebreak fix from the Step-0-era architecture review is already baked in) — noted
+   here only because it's the mirror image of #3: this is the step where `ARCHITECTURE.md`'s
+   original raw-SQL framing turned out to be *correct and necessary*, not a legacy assumption to
+   revise. Worth saying explicitly so the README doesn't read as "raw SQL was always wrong."
 
-**Exact next implementation step:** `docs/IMPLEMENTATION_PLAN.md` **Step 9 — Personal records**:
-- `personal-records.repository.ts`: the windowed-CTE-equivalent query for max weight / max volume
-  (`reps * weightKg`) / best Epley 1RM (`weightKg * (1 + reps/30)`), each with achievement date,
-  scoped to `(userId, exerciseName)`, with the `metric DESC, date ASC, id ASC` tiebreak specified
-  in `ARCHITECTURE.md` §5.3. Given Step 8 showed Prisma's query builder handles more than
-  originally expected, this needs a fresh look at whether the windowed-ranking query is actually
-  expressible without raw SQL (Prisma doesn't support `ROW_NUMBER() OVER (...)` window functions
-  natively) — likely the first genuine case in this codebase where raw SQL (`$queryRaw`) is
-  actually justified, not just assumed.
-- `calculateEpley1Rm(weightKg, reps)` as a small, directly unit-testable pure function.
-- `pr-query.dto.ts`, `GET /workouts/prs` route.
-- `hasData: false` empty-PR-data shape per `docs/CLARIFICATIONS.md` #17.
+**Exact next implementation step:** `docs/IMPLEMENTATION_PLAN.md` **Step 10 — PR range
+comparison** (`GET /workouts/prs/compare` per `docs/ARCHITECTURE.md` §1, or a `compare` query
+mode on the existing route — worth deciding explicitly): run the Step 9 PR query twice (once per
+caller-supplied range) per `docs/ARCHITECTURE.md` §5.3's decision to use two independent queries
+rather than one range-bucketed query, and compute a delta block (absolute + %) per
+`docs/CLARIFICATIONS.md` #8. Either range independently reporting `hasData:false` with null delta
+fields (not an error) needs explicit handling and tests, per the Step 9 checkpoint's own framing
+("keep this behavior easy for Step 10 comparison to reuse").
 
-**Files/modules likely to be touched next:** new `personal-records.repository.ts`/`.service.ts`
-files (or methods added to the existing `WorkoutsRepository`/`WorkoutsService` — worth deciding
-explicitly rather than defaulting, since `ARCHITECTURE.md` §13 originally sketched a separate
-`PersonalRecordsService`/`PersonalRecordsRepository`), `workouts.controller.ts` (new route),
-new DTOs, and the first real precision-sensitive unit tests for the Epley formula.
+**Files/modules likely to be touched next:** likely a new method on `PersonalRecordsService`
+(reusing `PersonalRecordsRepository.findCandidates` twice, once per range) rather than new
+repository/SQL work, a new query DTO for the two date ranges, and a new controller route —
+first real reuse of an existing Step 9 building block rather than new infrastructure.
