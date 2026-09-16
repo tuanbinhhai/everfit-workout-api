@@ -4,7 +4,9 @@ import { AppModule } from './app.module';
 import { configureApp } from './configure-app';
 
 async function bootstrap(): Promise<void> {
-  const app = await NestFactory.create(AppModule);
+  // Buffers Nest's own startup logs until configureApp() installs the pino
+  // logger below, so they go through the same structured output too.
+  const app = await NestFactory.create(AppModule, { bufferLogs: true });
   const configService = app.get(ConfigService);
   const port = configService.get<number>('port') ?? 3000;
 

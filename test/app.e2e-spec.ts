@@ -4,6 +4,7 @@ import type { Server } from 'http';
 import request from 'supertest';
 import { AppModule } from '../src/app.module';
 import { configureApp } from '../src/configure-app';
+import { REQUEST_ID_HEADER } from '../src/common/logging/resolve-request-id';
 
 describe('Health (e2e)', () => {
   let app: INestApplication;
@@ -29,5 +30,19 @@ describe('Health (e2e)', () => {
       .get('/health')
       .expect(200)
       .expect({ status: 'ok' });
+  });
+
+  it('generates and returns a request id when the client supplies none', async () => {
+    const res = await request(httpServer).get('/health').expect(200);
+    expect(res.headers[REQUEST_ID_HEADER]).toEqual(expect.any(String));
+    expect(res.headers[REQUEST_ID_HEADER].length).toBeGreaterThan(0);
+  });
+
+  it('reuses a client-supplied request id instead of generating a new one', async () => {
+    const res = await request(httpServer)
+      .get('/health')
+      .set(REQUEST_ID_HEADER, 'client-supplied-trace-id')
+      .expect(200);
+    expect(res.headers[REQUEST_ID_HEADER]).toBe('client-supplied-trace-id');
   });
 });
