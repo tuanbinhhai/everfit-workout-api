@@ -39,6 +39,13 @@ AI suggestion" below) — checked against all four required elements:
 No second rejected-suggestion example was manufactured to pad this out — none occurred, and none
 was invented.
 
+**Time estimate (assignment deliverable #5):** 12 hours, communicated to Everfit externally,
+before implementation began. That estimate was not tracked inside this repository as it happened
+— it is recorded here (and in `README.md`) only as of the Step 14 final-review checkpoint, once
+Step 14 itself flagged that no record of it existed in the repo yet and the repository owner
+confirmed the figure. The estimate itself predates this session's work; only its written record
+here is new.
+
 ---
 
 ## AI tools used

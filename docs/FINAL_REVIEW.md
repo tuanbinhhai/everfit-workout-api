@@ -33,7 +33,7 @@ verified against real running code, not test names or prior claims.
 | 20 | Commit history: iterative, meaningful messages | 22 commits, one per step | `git log --oneline` reviewed this session | PASS |
 | 21 | `README.md`: architecture (diagram a plus), setup (`docker compose up` or clear steps), API docs, schema/design decisions, trade-offs at scale | Present | `README.md` | PASS (one real setup bug found and fixed this review — see §2) |
 | 22 | Video walkthrough, 15–20 min, English, covering architecture/demo/AI workflow/line-by-line/10k-scaling | `VIDEO_WALKTHROUGH.md` (private prep script) | Script reviewed this session against real numbers/code | PASS (script quality; actual recording is the user's own remaining action, outside this repo's scope) |
-| 23 | Time estimate provided **before** starting | — | Acknowledged as a requirement in `docs/REQUIREMENT_ANALYSIS.md` §6, but no estimate value was ever recorded anywhere in this repo | **FAIL — see §2, flagged, not fabricated** |
+| 23 | Time estimate provided **before** starting | Original time estimate: **12 hours**, communicated to Everfit before implementation began | Confirmed by the repository owner on 2026-09-16; recorded in this repo's documentation (README "Time Estimate" section) only now, as a record of an estimate given externally beforehand — not something the repo itself tracked in real time | PASS |
 
 ---
 
@@ -125,17 +125,19 @@ omitted the top `import` line — a byte-for-byte diff against the real file cau
 
 **Fix:** added the import line back to the snippet.
 
-### LOW / KNOWN LIMITATION, not fixed — time estimate deliverable never recorded
+### RESOLVED — time estimate deliverable confirmed by the repository owner
 
-**Problem:** the assignment's deliverable #5 ("provide your time estimate before starting") is
-acknowledged as a requirement in `docs/REQUIREMENT_ANALYSIS.md` §6 but no actual estimate value
-was ever written down anywhere in this repository, at any point in the session history.
+**Original finding:** the assignment's deliverable #5 ("provide your time estimate before
+starting") was acknowledged as a requirement in `docs/REQUIREMENT_ANALYSIS.md` §6, but no actual
+estimate value had ever been written down anywhere in this repository, at any point in the session
+history up to that review.
 
-**Why not fixed:** this cannot be honestly fixed retroactively — the requirement is specifically
-for an estimate given **before** starting, and fabricating one now, at the end, would misrepresent
-the record. Flagged here for the repository owner to address directly (e.g., if an estimate was
-given elsewhere, outside this repo, it should be added to the README; if not, that's a real gap
-against the assignment's deliverables list).
+**Resolution:** the repository owner confirmed, on 2026-09-16, that an estimate of **12 hours**
+was communicated to Everfit externally, before implementation began — consistent with the
+assignment's requirement. This repository's documentation (README's "Time Estimate" section) now
+records that fact, but the estimate itself was not generated or timed by this documentation
+update — it reflects a real decision made and communicated before work started, only being written
+into the repo now as a record of it.
 
 ### Findings reviewed and explicitly NOT changed (no concrete problem found)
 
@@ -203,7 +205,7 @@ unreachable code. Documented in README ("Known Dependency Advisories") and `AI_W
 
 ## 6. Submission Checklist
 
-- [x] Original assignment requirements satisfied (22/23 — see the one flagged exception below)
+- [x] Original assignment requirements satisfied (23/23)
 - [x] README complete
 - [x] AI_WORKFLOW.md complete
 - [x] ≥2 genuine AI corrections documented
@@ -224,7 +226,8 @@ unreachable code. Documented in README ("Known Dependency Advisories") and `AI_W
 - [x] VIDEO_WALKTHROUGH.md not tracked
 - [x] Git working tree clean (after this review's commits)
 - [x] Video script ready
-- [ ] **Time estimate provided before starting — not found in this repository (see §2)**
+- [x] Time estimate provided before starting (12 hours, communicated to Everfit before
+      implementation began — confirmed by the repository owner, recorded in README)
 
 ## 7. Known Limitations (carried forward, not new)
 
@@ -236,5 +239,3 @@ unreachable code. Documented in README ("Known Dependency Advisories") and `AI_W
   defect (it's genuinely used elsewhere).
 - No load testing was performed; no concurrent-throughput claims are made anywhere in this
   project.
-- The time estimate deliverable (see §2) is unresolved and requires the repository owner's
-  direct input, not something further AI review can honestly resolve.

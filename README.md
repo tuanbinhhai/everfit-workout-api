@@ -771,6 +771,11 @@ policy:
 Full chronology of these decisions, including what was tried and corrected along the way, is in
 `AI_WORKFLOW.md`.
 
+## Time Estimate
+
+**12 hours** — communicated to Everfit before implementation began, per the assignment's
+deliverable #5 ("provide your time estimate before starting").
+
 ## Further Reading
 
 - **`docs/ARCHITECTURE.md`** — the design rationale (Postgres vs. Mongo, Prisma vs. TypeORM,
