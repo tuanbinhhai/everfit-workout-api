@@ -26,7 +26,10 @@
     "prisma:migrate": "prisma migrate dev",
     "prisma:deploy": "prisma migrate deploy",
     "prisma:generate": "prisma generate",
-    "prisma:seed": "ts-node prisma/seed.ts"
+    "prisma:seed": "ts-node prisma/seed.ts",
+    "perf:seed": "ts-node scripts/seed-scale-test.ts",
+    "perf:clean": "ts-node scripts/clean-scale-test.ts",
+    "perf:explain": "ts-node scripts/explain-queries.ts"
   },
   "dependencies": {
     "@nestjs/common": "^11.2.5",
