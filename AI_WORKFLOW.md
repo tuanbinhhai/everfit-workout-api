@@ -61,6 +61,7 @@ correction happens inline, in conversation, before code is accepted.
 | 10 | Step 5 — structured error handling | Exact response shape specified; asked to centralize mapping, not scatter try/catch | `GlobalExceptionFilter` (`@Catch()` on everything) + a custom `ValidationPipe.exceptionFactory` flattening nested `ValidationError[]` into the same `details[]` shape | Matched the requested shape; extracted a shared `configureApp()` so e2e tests exercise the identical pipe/filter setup as `main.ts` rather than risking drift between prod and test | Committed (`05a8cbb`); filter unit tests 6/6, incl. one asserting 500s are logged and 400s are not |
 | 11 | Step 6 — workout DTOs | Explicit requirement: reject impossible dates, not just regex-shaped ones; keep unit-support checking out of DTOs | `IsCalendarDate` custom validator (regex + `Date.UTC` round-trip to catch e.g. `2026-02-30`), `exerciseName` trimmed via `class-transformer` before `@IsNotEmpty()` | Matched the requested shape directly | Committed (`05a8cbb`) |
 | 12 | Step 7 — POST /workouts | Explicit repository responsibility split (batch inserts, one transaction, no business logic) | `createManyAndReturn` for both entries and sets (real multi-row `INSERT...RETURNING`, not N individual inserts), transaction rollback verified against real Postgres | Matched the requested shape; caught and fixed my own test-expectation bug (see "AI mistakes" below) via the integration run, not code review alone | Committed (`5fedf19`); 47 unit / 10 integration / 23 e2e, Docker-verified with real curl + psql |
+| 13 | Step 8 — GET /workouts history + cursor pagination | Explicit instruction to prefer Prisma's query builder over raw SQL unless there's a concrete benefit, even though ARCHITECTURE.md originally framed these same queries around raw SQL | `contains`/`mode:'insensitive'` for trigram-backed substring search, an `OR`-based keyset predicate for `(date,id) < (cursor.date,cursor.id)`, a second small query to resolve muscleGroup → exercise names (no raw SQL, no schema relation added) | Matched the requested shape; caught two real issues via actual execution, not code review — see "AI mistakes" below | Committed (`859cd5c`); 77 unit / 24 integration / 43 e2e, Docker-verified with real curl + psql incl. real cursor-based pagination |
 
 ---
 
@@ -191,6 +192,74 @@ host-environment-specific state that silently corrupts a "works on my machine" b
 into a container with different absolute paths. Verify by inspecting the actual running
 container/image, not by reading the build log for the word "error."
 
+### 5. Missing display-boundary rounding on `GET /workouts`'s converted weight
+
+**Original AI output (Step 8 `workouts.service.ts`, first draft):** `toHistoryResponse` computed
+`convertedWeight` as `this.unitConversion.fromKg(Number(set.weightKg), unit).toString()` — the
+raw, unrounded floating-point conversion result.
+
+**Why it was wrong:** `docs/CLARIFICATIONS.md` #11 — written and approved back in Phase 2 —
+explicitly says "rounding to 2 decimal places happens only at the API response/display boundary."
+`GET /workouts`'s `convertedWeight` field is exactly that boundary (a fresh runtime conversion
+computed for display, not a stored value), and I simply didn't apply the rounding there. This
+wasn't caught by any unit, integration, or e2e test, because all of those asserted against
+`Number(convertedWeight)` with `toBeCloseTo`, which doesn't care about display formatting — only
+the manual verification step (real `curl` against the real Docker container) surfaced it, by
+producing a visibly wrong response like `"convertedWeight": "330.6933932773164"`.
+
+**How it was caught:** Manual API verification (checklist item 5, "requested lb conversion")
+during the required Docker rebuild step — not code review, not automated tests. This is precisely
+why that manual step exists in the plan rather than trusting test suites alone.
+
+**Correction:** Changed `.toString()` to `.toFixed(2)` at that one call site, with a comment
+citing the CLARIFICATIONS.md decision. Updated the 4 unit-test and 2 e2e-test assertions that had
+been asserting on the un-rounded value (`toBeCloseTo(220.462262, 4)` → `toBe('220.46')`, etc.),
+and rewrote one test (`'always converts from canonical weightKg'`) whose original design relied on
+a floating-point precision artifact that becomes invisible once rounded to 2dp — replaced with a
+deliberately inconsistent original/weightKg pair so the assertion no longer depends on rounding
+behavior to make its point. Rebuilt Docker and reverified the same manual check showed clean
+`"220.46"`-style output.
+
+**What was learned:** A previously-approved design decision (CLARIFICATIONS.md #11) can still be
+missed during implementation weeks/steps later if nothing forces a concrete check against it —
+and unit tests using approximate-equality matchers (`toBeCloseTo`) are exactly the kind of test
+that won't catch a missing display-formatting step, because they're deliberately insensitive to
+the formatting difference that was the actual bug. Manual, real-output verification catches a
+different class of bug than automated tests with loose numeric assertions.
+
+### 6. Integration/e2e test files racing each other against the shared dev Postgres database
+
+**Original AI output (Step 8, adding a third integration spec file):** `npm run test:integration`
+failed with a wrong row appearing in an unrelated test's result set (a `Deadlift` entry from a
+different spec file showing up in a query that should only have matched two entries the test
+itself had just created).
+
+**Why it was wrong:** Jest runs separate test *files* in parallel worker processes by default.
+None of the three integration spec files (`prisma.integration-spec.ts`,
+`workouts-repository.integration-spec.ts`, the new `workouts-history.integration-spec.ts`) scoped
+their test data or cleanup to avoid colliding with the others — all used the literal userId
+`'user-1'` and all had an `afterEach` that deleted *every* row in `workout_entries`/`workout_sets`,
+not just their own. Running three such files concurrently against one shared, real Postgres
+database is a textbook race: one file's cleanup or insert lands in the middle of another file's
+test. This had been latent since Step 2 (with two files it apparently didn't surface visibly) and
+only became reliably reproducible once a third file added enough concurrent activity.
+
+**How it was caught:** Actually running `npm run test:integration` and reading the failure's
+*data*, not just its pass/fail status — the unexpected `Deadlift` row was the tell, traced by
+`grep`-ing the test tree for that literal string to find which file created it.
+
+**Correction:** Added `--runInBand` to both the `test:integration` and `test:e2e` npm scripts
+(package.json) — Jest's standard, well-known fix for a suite of tests sharing one external
+stateful resource. Considered per-file data isolation (unique userId per file) as an alternative,
+but serial execution is simpler, more robust against future files making the same shared-`'user-1'`
+mistake, and the tests already run fast enough (well under a couple of seconds) that losing
+worker-level parallelism has no practical cost here.
+
+**What was learned:** A shared external resource (one Postgres instance) used by multiple test
+files is a parallelism hazard by default, not just when a test explicitly looks racy — the fix
+needs to be structural (serialize the suite) rather than per-test, or every future spec file
+author has to remember an isolation convention nothing enforces.
+
 ### Minor, for completeness: a wrong test expectation (not application code), caught by actually running it
 
 Not counted as one of the two required examples above (those are substantive; this is a one-line
@@ -296,6 +365,19 @@ What was personally verified in this session, not just generated and trusted:
   `UNIQUE(workout_entry_id, set_index)`) partway through a multi-set entry, and asserts the
   **entire** transaction — including the already-processed valid set and the entry row itself —
   rolls back, by checking real row counts before and after.
+- **Step 8 commands actually executed**: `npm test` (77/77), `npm run test:integration` (24/24,
+  real Postgres, after fixing the parallel-worker race — see mistake #6), `npm run test:e2e`
+  (43/43), `npm run lint`, `npx nest build`, `npx prettier --check`, and a full Docker rebuild +
+  10-item manual verification checklist against the real running container (normal history,
+  partial search, date range, muscle group, lb conversion, combined filters, real page1→page2
+  pagination via the actual returned `nextCursor`, same-date pagination, empty result, malformed
+  cursor) — which is what caught mistake #5 (missing display rounding) in the first place, before
+  it was ever committed.
+- **Persisted-value invariance checked directly via `psql`, not inferred**: after issuing several
+  `GET /workouts?unit=lb` requests against previously-stored kg data, queried `workout_sets`
+  directly to confirm `weight`, `unit`, and `weight_kg` were byte-for-byte unchanged from what was
+  originally stored — proving the read path never mutates persisted values, not just asserting it
+  in a docstring.
 
 This section will keep growing as later implementation steps land.
 
@@ -303,10 +385,9 @@ This section will keep growing as later implementation steps land.
 
 ## Session Handoff
 
-**Date / session:** 2026-09-15, end-of-day closeout. Session 1: Phases 1–4 planning + Steps 0–2.
-Session 2 (same day, continuation): Steps 3–4. Session 3 (same day, continuation): Steps 5–7.
-This update is the end-of-day handoff after Session 3 — no code changed since the Step 5-7
-report; this section only confirms final state and records the closeout itself.
+**Date / session:** 2026-09-15/16. Session 1 (09-15): Phases 1–4 planning + Steps 0–2.
+Session 2 (09-15, continuation): Steps 3–4. Session 3 (09-15, continuation): Steps 5–7 + end-of-day
+closeout. Session 4 (09-16): context restored and re-verified, then Step 8.
 
 **Completed implementation steps** (of `docs/IMPLEMENTATION_PLAN.md`'s 15 steps):
 - Step 0 — NestJS bootstrap + tooling. Commit `4bb235b`.
@@ -314,103 +395,113 @@ report; this section only confirms final state and records the closeout itself.
 - Step 2 — Database schema + Prisma migration. Commit `09349ce`.
 - Step 3 — Configurable exercise → muscle group provider. Commit `f109358`.
 - Step 4 — Extensible unit conversion. Commit `7b6484f`.
-- Step 5 — Structured error handling: `GlobalExceptionFilter` (catches everything, maps
-  `UnsupportedUnitError`/`HttpException`/unknown errors to one consistent shape, logs 500s
-  server-side without leaking internals to the client) + a `ValidationPipe.exceptionFactory` that
-  flattens class-validator's nested `ValidationError[]` into the same `details[]` shape. Shared
-  `configureApp()` so e2e tests use the identical pipe/filter setup as production. Commit
-  `05a8cbb` (bundled with Step 6).
-- Step 6 — Workout DTOs: `BulkCreateWorkoutDto` → `CreateWorkoutEntryDto[]` → `CreateWorkoutSetDto[]`,
-  a custom `IsCalendarDate` validator (rejects ISO datetimes and impossible dates via a `Date`
-  round-trip check), `exerciseName` trimmed before validation. DTOs validate shape only; unit
-  support-checking stays in `UnitConversionService`. Commit `05a8cbb`.
-- Step 7 — `POST /workouts`: `WorkoutsController` → `WorkoutsService` (normalize, convert to kg,
-  assign `setIndex`) → `WorkoutsRepository` (one Prisma transaction, `createManyAndReturn` for
-  true multi-row batch inserts of both entries and sets). All-or-nothing bulk semantics verified
-  against real Postgres, not assumed. Commit `5fedf19`.
+- Step 5 — Structured error handling. Commit `05a8cbb` (bundled with Step 6).
+- Step 6 — Workout DTOs. Commit `05a8cbb`.
+- Step 7 — `POST /workouts` atomic bulk logging. Commit `5fedf19`.
+- Step 8 — `GET /workouts` history: filtering (partial exercise name via the existing trigram
+  index, inclusive date range with a cross-field `from<=to` validator, muscle group via an
+  extended `MuscleGroupProvider.listExerciseNames()`), `unit` output conversion (default kg,
+  always computed from canonical `weightKg`, never from the original value, rounded to 2dp at
+  this display boundary per `docs/CLARIFICATIONS.md` #11), and keyset cursor pagination
+  (`date DESC, id DESC`, opaque base64url `{date, id}` cursor, `limit+1` fetch for `hasMore`
+  without `COUNT(*)`). Built with Prisma's query builder throughout, no raw SQL. Commit `859cd5c`.
 
-Plus Phase 1–4 planning docs (`b673004`) and the two prior `AI_WORKFLOW.md` handoff updates
-(`eb6e761`, `344d989`, `0f2ef49`).
+Plus Phase 1–4 planning docs (`b673004`) and the `AI_WORKFLOW.md` handoff updates (`eb6e761`,
+`344d989`, `0f2ef49`, `d110c96`, `0e46962`).
 
-**Current implementation state:** Steps 0–7 fully implemented and verified for real. Step 8
-(workout history: `GET /workouts` with filtering, unit conversion, cursor pagination) has **not**
-been started.
+**Current implementation state:** Steps 0–8 fully implemented and verified for real. Step 9
+(Personal Records) has **not** been started — confirmed by inspecting `workouts.controller.ts`
+(only `POST` and the new `GET` history route exist) and `workouts.repository.ts`/`.service.ts`
+(no PR/Epley/1RM logic anywhere).
 
 **Tests currently passing/failing:**
-- Unit (`npm test`): **47/47 passing.** Includes the first `WorkoutsService` unit tests (mocked
-  repository, no DB) and the `GlobalExceptionFilter`/`formatValidationErrors`/`IsCalendarDate`
-  suites new this checkpoint.
-- Integration (`npm run test:integration`, real Postgres): **10/10 passing** — 3 from Step 2
-  (Prisma wiring/constraints) + 7 new `WorkoutsRepository` tests (single/multi entry persistence,
-  weight/unit/weightKg storage, setIndex ordering, per-entry set attribution, transaction rollback
-  on a UNIQUE violation, CHECK(reps>=1) enforced even bypassing the DTO layer).
-- E2E (`npm run test:e2e`, real Postgres via full HTTP stack): **23/23 passing** — 1 health check
-  + 22 `POST /workouts` tests (5 happy paths, 16 validation/error paths, 1 concurrency smoke test).
+- Unit (`npm test`): **77/77 passing** — adds `cursor.spec.ts` (encode/decode round-trip + all 7
+  documented malformed-cursor cases), `is-on-or-before.validator.spec.ts` (cross-field date-range
+  validation), `PrismaMuscleGroupProvider.listExerciseNames` cases, and a `WorkoutsService.getHistory`
+  suite (filters passed correctly, default/requested unit, conversion-from-canonical-weightKg,
+  nextCursor from the correct last record, hasMore behavior, empty-result message, unsupported
+  unit and malformed cursor both short-circuit before touching the repository).
+- Integration (`npm run test:integration`, real Postgres, **now run with `--runInBand`** — see
+  mistake #6): **24/24 passing** — 3 Step 2 + 10 Step 7 (unchanged) + 11 new `findHistory` tests
+  (user isolation, date/id ordering, inclusive `from`/`to` boundaries, partial + case-insensitive
+  search, muscle-group filtering incl. no-match, combined filters, multi-page pagination with no
+  skipped/duplicated rows across 25 entries, same-date cursor-boundary pagination, empty results,
+  persisted-value invariance verified via a direct `psql`-equivalent `findUniqueOrThrow`).
+- E2E (`npm run test:e2e`, real Postgres via full HTTP stack, **now run with `--runInBand`**):
+  **43/43 passing** — 1 health + 22 `POST /workouts` (unchanged) + 20 new `GET /workouts` tests
+  (10 happy paths, real two-page cursor pagination via the actual returned `nextCursor`, 8
+  validation cases, 1 empty-result case).
 
 **Build/lint/format status:**
 - `npm run build`: clean, `dist/main.js` at the correct path.
-- `npm run lint`: **0 errors, 0 warnings** — the 3 warnings flagged at the last checkpoint (2×
-  `prisma as any` in a test mock, 1× `app.getHttpServer()` typed `any`) were fixed this session by
-  typing the mocks/helpers properly, not suppressed.
+- `npm run lint`: 0 errors, 0 warnings.
 - `npx prettier --check`: clean.
 
-**Docker status:** Re-verified end-to-end this checkpoint (Step 7 changes real runtime
-behavior, so this was required, not optional). `docker compose up -d --build` → real `curl`
-requests against the running container for `GET /health`, a valid bulk `POST /workouts` (kg + lb
-in one request), an invalid `POST /workouts` (impossible date → 400, confirmed nothing
-persisted), and a two-exercise bulk `POST /workouts` — every result cross-checked against the
-actual rows in Postgres via `psql`, not just the HTTP response body. Stack torn down
-(`docker compose down`) at the end of the checkpoint; volume preserved.
+**Docker status:** Rebuilt and manually verified end-to-end this checkpoint (real runtime
+behavior changed — new endpoint, new DI wiring — so this was done, not skipped). All 10 checklist
+items verified via real `curl`: normal history, partial search, date range, muscle group, lb
+conversion, combined filters, **real** page1→page2 pagination using the actual `nextCursor` value
+returned by the API (not a hand-constructed one), same-date pagination, empty result, malformed
+cursor. This manual pass is what caught mistake #5 (missing display rounding) before it was ever
+committed — the rebuild was redone after the fix and reverified clean. Persisted rows
+cross-checked via `psql` before/after several `unit=lb` reads to confirm no mutation. Stack torn
+down (`docker compose down`) at the end; volume preserved.
 
-**Database status:** Same Postgres volume as previous checkpoints, now also containing workout
-entries/sets from manual Docker verification (harmless leftover test data — `docker-user` rows,
-ids in the 90s — not cleaned up since the volume is dev-only and gets reset via
-`docker compose down -v` if ever needed; documented here rather than silently left unexplained).
+**Database status:** Same Postgres volume as previous checkpoints. Manually-seeded verification
+data from this and the prior checkpoint (`manual-user`, `manual-user2`, `page-user`,
+`sameday-user`, etc.) is left in the dev volume — harmless, dev-only, not cleaned up, consistent
+with how the same trade-off was handled and documented at the Step 7 checkpoint.
 
-**Latest commit:** `d110c96` — `docs: record Step 5-7 AI interactions and session handoff in
-AI_WORKFLOW.md` (the code itself last changed at `5fedf19`). This end-of-day update will be its
-own commit on top, per usual practice — this file is maintained continuously, not backfilled.
+**Latest commit:** `859cd5c` — `feat: add workout history filtering and cursor pagination` (this
+`AI_WORKFLOW.md` update will be its own commit immediately after being written).
 
-**Working tree status:** Clean — `git status` reports nothing to commit prior to this update;
-verified directly, not assumed. No Docker containers running (`docker compose ps` empty); the
-Postgres data volume is preserved for the next session.
+**Working tree status:** Clean prior to this update — verified via `git status` at the start of
+this session (context-restoration check) and again just before this commit.
 
-**Known issues:** Same as previous checkpoints (transitive `npm audit` advisories in unreachable
-code paths; host port 5432→5433 remap, permanent and documented) — nothing new introduced by
-Steps 5–7. Leftover manual-verification rows in the dev Postgres volume (see Database status
-above) — cosmetic, not a defect.
+**Known issues:**
+- Same as previous checkpoints (transitive `npm audit` advisories in unreachable code paths; host
+  port 5432→5433 remap, permanent and documented).
+- **New, fixed this checkpoint, worth remembering going forward:** integration/e2e test files
+  share one live Postgres database and were racing each other under Jest's default parallel-worker
+  execution (mistake #6). Fixed via `--runInBand` on both `test:integration` and `test:e2e` npm
+  scripts. Any future spec file added to either suite is safe by default now (serial execution),
+  but should still avoid assuming exclusive ownership of shared-looking data like `'user-1'` if
+  that assumption ever needs to be relaxed back to parallel execution for speed.
 
 **Unresolved decisions:** None blocking.
 
-**Outstanding assignment requirement:** per explicit instruction this session, the genuine
-rejected-AI-suggestion requirement is being treated as **still pending**, even though a "Rejected
-AI suggestion (real)" section already exists above (the NestJS CLI scaffold's Vitest/oxlint
-defaults, self-corrected during Step 0). That entry stays in the file as a real, accurate record
-of what happened, but nothing further is being invented to additionally satisfy this requirement.
-If a genuine rejection happens in a later step — the human directing a change away from something
-proposed during this collaboration — it will be recorded then, truthfully, not before.
+**Outstanding assignment requirement:** unchanged — the genuine rejected-AI-suggestion
+requirement is still being treated as satisfied only by the one real Step-0 example (NestJS CLI
+scaffold defaults), not supplemented further. No genuine rejection occurred this checkpoint either.
 
 **Architecture deviations:**
-1. (Carried forward, unchanged) Step 4's `UnitConversionService` uses a flat conversion-factor
-   registry instead of `ARCHITECTURE.md` §12's per-unit-converter-class description — explicitly
-   instructed, to be reconciled when docs are next synchronized.
-2. (New, also explicitly instructed) The `POST /workouts` response returns the full created
-   entries+sets (id, userId, exerciseName, date, and each set's id/setIndex/reps/weight/unit/
-   weightKg) rather than just ids — `ARCHITECTURE.md` didn't specify an exact response shape for
-   this endpoint, so this was a reasonable, explainable choice made during implementation, not a
-   deviation from a documented decision. Noted here for README/API-docs consistency at Step 13.
+1. (Carried forward) Step 4's flat conversion-factor registry vs. `ARCHITECTURE.md` §12's
+   per-class description — explicitly instructed, to reconcile at the README step.
+2. (Carried forward) `POST /workouts`'s full-entry response shape, not specified in
+   `ARCHITECTURE.md` — a reasonable implementation-time choice, to reconcile at the README step.
+3. (New) `ARCHITECTURE.md` §5–§8 originally framed trigram search and keyset pagination around
+   raw SQL; Step 8 was explicitly instructed to prefer Prisma's query builder instead, and it
+   turned out to express both adequately (an `ILIKE`-equivalent `contains` for the trigram-indexed
+   search, an `OR`-based predicate for the keyset comparison) with no raw SQL needed. The
+   underlying index strategy `ARCHITECTURE.md` describes is unchanged and still exactly what's
+   used — only the query-construction *mechanism* differs from the doc's original framing. To
+   reconcile at the README/docs-sync step alongside deviations #1 and #2.
 
-**Exact next implementation step:** `docs/IMPLEMENTATION_PLAN.md` **Step 8 — Workout history
-(`GET /workouts`)**:
-- `history-query.dto.ts` (userId, optional exerciseName/from/to/muscleGroup/unit/cursor/limit)
-- Repository method for keyset-paginated, filtered history (base index vs. exercise-filtered
-  index per `ARCHITECTURE.md` §7/§8; partial-match search via the trigram index — real usage of
-  the `idx_entries_exercise_trgm` index created in Step 2 but never yet exercised by any query)
-- Service-layer unit conversion of returned weights to the requested display unit
-- Empty-result shape with a message, per `docs/CLARIFICATIONS.md` #17
+**Exact next implementation step:** `docs/IMPLEMENTATION_PLAN.md` **Step 9 — Personal records**:
+- `personal-records.repository.ts`: the windowed-CTE-equivalent query for max weight / max volume
+  (`reps * weightKg`) / best Epley 1RM (`weightKg * (1 + reps/30)`), each with achievement date,
+  scoped to `(userId, exerciseName)`, with the `metric DESC, date ASC, id ASC` tiebreak specified
+  in `ARCHITECTURE.md` §5.3. Given Step 8 showed Prisma's query builder handles more than
+  originally expected, this needs a fresh look at whether the windowed-ranking query is actually
+  expressible without raw SQL (Prisma doesn't support `ROW_NUMBER() OVER (...)` window functions
+  natively) — likely the first genuine case in this codebase where raw SQL (`$queryRaw`) is
+  actually justified, not just assumed.
+- `calculateEpley1Rm(weightKg, reps)` as a small, directly unit-testable pure function.
+- `pr-query.dto.ts`, `GET /workouts/prs` route.
+- `hasData: false` empty-PR-data shape per `docs/CLARIFICATIONS.md` #17.
 
-**Files/modules likely to be touched next:** `src/workouts/dto/history-query.dto.ts`,
-`workouts.repository.ts` (new read method, first real use of raw/`$queryRaw`-style Prisma access
-for keyset pagination per `ARCHITECTURE.md` §8), `workouts.service.ts`, `workouts.controller.ts`
-(new `GET /workouts` route), and the `ExerciseMetadataModule`'s `MuscleGroupProvider` gets its
-first real caller (muscle-group filtering) via `WorkoutsModule` importing `ExerciseMetadataModule`.
+**Files/modules likely to be touched next:** new `personal-records.repository.ts`/`.service.ts`
+files (or methods added to the existing `WorkoutsRepository`/`WorkoutsService` — worth deciding
+explicitly rather than defaulting, since `ARCHITECTURE.md` §13 originally sketched a separate
+`PersonalRecordsService`/`PersonalRecordsRepository`), `workouts.controller.ts` (new route),
+new DTOs, and the first real precision-sensitive unit tests for the Epley formula.
