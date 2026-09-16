@@ -1,6 +1,11 @@
-import { Body, Controller, Post } from '@nestjs/common';
+import { Body, Controller, Get, Post, Query } from '@nestjs/common';
 import { BulkCreateWorkoutDto } from './dto/bulk-create-workout.dto';
-import { WorkoutEntryResponse, WorkoutsService } from './workouts.service';
+import { WorkoutHistoryQueryDto } from './dto/workout-history-query.dto';
+import {
+  WorkoutEntryResponse,
+  WorkoutHistoryResult,
+  WorkoutsService,
+} from './workouts.service';
 
 @Controller('workouts')
 export class WorkoutsController {
@@ -11,5 +16,12 @@ export class WorkoutsController {
     @Body() dto: BulkCreateWorkoutDto,
   ): Promise<{ entries: WorkoutEntryResponse[] }> {
     return this.workoutsService.logWorkouts(dto);
+  }
+
+  @Get()
+  async history(
+    @Query() query: WorkoutHistoryQueryDto,
+  ): Promise<WorkoutHistoryResult> {
+    return this.workoutsService.getHistory(query);
   }
 }

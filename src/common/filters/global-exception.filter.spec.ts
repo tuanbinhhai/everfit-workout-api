@@ -5,6 +5,7 @@ import {
 } from '@nestjs/common';
 import type { Request, Response } from 'express';
 import { UnsupportedUnitError } from '../../unit-conversion/unsupported-unit.error';
+import { InvalidCursorError } from '../../workouts/cursor';
 import {
   GlobalExceptionFilter,
   StructuredErrorBody,
@@ -46,6 +47,22 @@ describe('GlobalExceptionFilter', () => {
         message: 'Unsupported weight unit: "oz"',
         details: [{ field: 'unit', issue: 'Unsupported weight unit: "oz"' }],
         path: '/workouts',
+      }),
+    );
+  });
+
+  it('maps InvalidCursorError to a structured 400 response without leaking parser details', () => {
+    const { host, status, json } = createMockHost();
+
+    filter.catch(new InvalidCursorError(), host);
+
+    expect(status).toHaveBeenCalledWith(400);
+    expect(json).toHaveBeenCalledWith(
+      expect.objectContaining({
+        statusCode: 400,
+        error: 'Bad Request',
+        message: 'Invalid pagination cursor',
+        details: [{ field: 'cursor', issue: 'Invalid pagination cursor' }],
       }),
     );
   });

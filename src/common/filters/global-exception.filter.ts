@@ -8,6 +8,7 @@ import {
 } from '@nestjs/common';
 import type { Request, Response } from 'express';
 import { UnsupportedUnitError } from '../../unit-conversion/unsupported-unit.error';
+import { InvalidCursorError } from '../../workouts/cursor';
 import { FieldError } from '../validation/format-validation-errors';
 
 export interface StructuredErrorBody {
@@ -67,6 +68,15 @@ export class GlobalExceptionFilter implements ExceptionFilter {
         error: STATUS_NAMES[HttpStatus.BAD_REQUEST],
         message: exception.message,
         details: [{ field: 'unit', issue: exception.message }],
+      };
+    }
+
+    if (exception instanceof InvalidCursorError) {
+      return {
+        statusCode: HttpStatus.BAD_REQUEST,
+        error: STATUS_NAMES[HttpStatus.BAD_REQUEST],
+        message: exception.message,
+        details: [{ field: 'cursor', issue: exception.message }],
       };
     }
 

@@ -14,4 +14,12 @@ export class PrismaMuscleGroupProvider implements MuscleGroupProvider {
     });
     return mapping?.muscleGroup ?? null;
   }
+
+  async listExerciseNames(muscleGroup: string): Promise<string[]> {
+    const rows = await this.prisma.exerciseMuscleGroup.findMany({
+      where: { muscleGroup: normalizeExerciseName(muscleGroup) },
+      select: { exerciseNameNormalized: true },
+    });
+    return rows.map((row) => row.exerciseNameNormalized);
+  }
 }

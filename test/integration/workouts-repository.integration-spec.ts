@@ -1,5 +1,6 @@
 import { ConfigService } from '@nestjs/config';
 import configuration from '../../src/config/configuration';
+import { PrismaMuscleGroupProvider } from '../../src/exercise-metadata/prisma-muscle-group.provider';
 import { PrismaService } from '../../src/prisma/prisma.service';
 import {
   WorkoutEntryInput,
@@ -14,7 +15,8 @@ describe('WorkoutsRepository (integration)', () => {
     const configService = new ConfigService(configuration());
     prisma = new PrismaService(configService);
     await prisma.onModuleInit();
-    repository = new WorkoutsRepository(prisma);
+    const muscleGroupProvider = new PrismaMuscleGroupProvider(prisma);
+    repository = new WorkoutsRepository(prisma, muscleGroupProvider);
   });
 
   afterAll(async () => {
