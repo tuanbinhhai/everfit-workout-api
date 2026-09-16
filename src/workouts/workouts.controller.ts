@@ -1,6 +1,11 @@
 import { Body, Controller, Get, Post, Query } from '@nestjs/common';
 import { BulkCreateWorkoutDto } from './dto/bulk-create-workout.dto';
+import { PersonalRecordsQueryDto } from './dto/personal-records-query.dto';
 import { WorkoutHistoryQueryDto } from './dto/workout-history-query.dto';
+import {
+  PersonalRecordsResult,
+  PersonalRecordsService,
+} from './personal-records.service';
 import {
   WorkoutEntryResponse,
   WorkoutHistoryResult,
@@ -9,7 +14,10 @@ import {
 
 @Controller('workouts')
 export class WorkoutsController {
-  constructor(private readonly workoutsService: WorkoutsService) {}
+  constructor(
+    private readonly workoutsService: WorkoutsService,
+    private readonly personalRecordsService: PersonalRecordsService,
+  ) {}
 
   @Post()
   async create(
@@ -23,5 +31,12 @@ export class WorkoutsController {
     @Query() query: WorkoutHistoryQueryDto,
   ): Promise<WorkoutHistoryResult> {
     return this.workoutsService.getHistory(query);
+  }
+
+  @Get('prs')
+  async personalRecords(
+    @Query() query: PersonalRecordsQueryDto,
+  ): Promise<PersonalRecordsResult> {
+    return this.personalRecordsService.getPersonalRecords(query);
   }
 }
