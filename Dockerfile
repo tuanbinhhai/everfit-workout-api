@@ -21,8 +21,16 @@ WORKDIR /app
 ENV NODE_ENV=production
 COPY package.json package-lock.json ./
 COPY prisma ./prisma
+# prisma.config.ts (Prisma 7's config model — see prisma.config.ts) supplies
+# the datasource URL for `prisma migrate deploy` below; schema.prisma itself
+# has no `url` in its datasource block, so without this file the migrate
+# step has nothing to connect with.
+COPY prisma.config.ts ./
 RUN npm ci --omit=dev
 COPY --from=build /app/dist ./dist
 
 EXPOSE 3000
-CMD ["node", "dist/main.js"]
+# Applies pending migrations against DATABASE_URL before starting the app,
+# so `docker compose up` alone brings up a working API against a fresh
+# database with no manual migration step.
+CMD ["sh", "-c", "npx prisma migrate deploy && node dist/main.js"]

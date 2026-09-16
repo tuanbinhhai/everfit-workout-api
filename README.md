@@ -134,6 +134,35 @@ a PR.
   comparisons, and 4 decimal places comfortably absorbs `lb → kg` conversion precision
   (`0.45359237`) without visible drift.
 
+## Timezone Handling
+
+The assignment recommends UTC storage; this system stores **two different kinds of temporal
+data differently**, deliberately, rather than applying one blanket "everything in UTC" rule:
+
+- **`WorkoutEntry.date`** is a plain `DATE` column (`YYYY-MM-DD`, no time-of-day, no offset) —
+  **not** converted through UTC. This is a *business calendar date* the caller explicitly chose
+  ("I did this workout on the 15th"), not an instant in time. Converting it through UTC would be
+  actively wrong: a client-supplied datetime like `2026-09-15T23:00:00-05:00` would shift to
+  `2026-09-16` under naive UTC conversion — silently changing the day the user actually logged,
+  purely as a side effect of whatever offset happened to be attached to the request. To prevent
+  this entirely, the API only accepts a plain `YYYY-MM-DD` string for `date` (an ISO datetime is
+  rejected with a `400`, not silently truncated — see [Validation](#validation--errors)), and
+  parses/formats it via explicit UTC calendar-component construction
+  (`src/common/calendar-date.ts`, using `Date.UTC(...)` and `getUTC*()` accessors) so the host
+  machine's own local timezone can never shift the stored day by ±1, regardless of where the API
+  process happens to run.
+- **`createdAt`/`updatedAt`** genuinely are instants in time (when a row was written), so they
+  **are** stored as UTC (`TIMESTAMPTZ`), per the assignment's recommendation.
+
+**Trade-off:** this means two timestamp-shaped columns in the same schema follow different
+storage rules. The trade-off is accepted because treating a business date as an instant is the
+more common and more subtle bug in systems like this — the small inconsistency of "one column
+type follows the UTC recommendation, one doesn't" is worth avoiding a real, easy-to-trigger
+date-shifting bug. Verified end-to-end (not just asserted): boundary dates
+(`2026-01-01`, `2026-12-31`, a leap day) round-trip through the full HTTP → DTO → service → Prisma
+→ PostgreSQL `DATE` → HTTP response path with zero shift, independent of the server's or
+database's own local timezone.
+
 ## Index Strategy
 
 | Index | Table | Columns | Design intent |
@@ -376,6 +405,20 @@ size, not the depth, for the *forward-scan* case — see
 [Performance Verification](#performance-verification) for the measured exception (a benchmark-only
 deep-offset lookup, not the production path).
 
+**Pagination correctness under concurrent inserts — stated precisely, not oversold.** For a
+*stable* dataset (no writes between page requests), keyset pagination guarantees no skipped and no
+duplicated rows: each page's boundary is an absolute `(date, id)` value, not a relative offset. If
+a new entry is inserted *while* a client is paginating: a new row that would sort **after** the
+client's current cursor position (i.e., it belongs on a page already fetched) is simply never seen
+— it doesn't retroactively appear or shift anything already returned. A new row that belongs
+**before** the cursor (i.e., on a page not yet fetched) will correctly appear when that page is
+fetched — this is new data appearing in its correct position, not a duplicate or a skip. No
+snapshot isolation is used, and none is claimed: each page reflects the live table state at the
+moment it's fetched. A cursor is also not scoped to the user who obtained it — reusing another
+user's cursor value with a different `userId` is well-defined (the `userId` filter still applies
+independently) and returns no cross-user data, but this is a byproduct of `userId` being a required
+filter, not an authorization boundary (the assignment specifies no authentication).
+
 ## Personal Records
 
 Computed in a single windowed SQL query (`PersonalRecordsRepository.findCandidates`) over three
@@ -558,6 +601,18 @@ Note the host↔container port mapping: Postgres is reachable from the **host** 
 Postgres install; the API container talks to Postgres on the normal `5432` internally, since
 Docker Compose's internal network is unaffected by the host remap.
 
+**Optional: seed demo muscle-group data.** `exercise_muscle_groups` starts empty after a fresh
+`docker compose up` — the API works fully without it (muscle-group filtering just matches nothing
+until the table has rows; this is graceful, not an error). To populate it with a small demo set
+(bench press → chest, squat → legs, etc.), run the seed script from the **host** (it connects to
+the same Postgres via the host-exposed `localhost:5433` port from `.env`; the seed script needs
+`ts-node`, a dev dependency not present in the production container, so it isn't run from inside
+the `api` container):
+```bash
+npm install
+npm run prisma:seed
+```
+
 ### Local (non-Docker) setup
 
 ```bash
@@ -618,6 +673,24 @@ npm run perf:clean     # remove the perf dataset (scoped to perf-user / perf-use
 ```
 
 These are separate from `npm test` and do not run in CI or as part of the normal test suite.
+
+## Known Dependency Advisories
+
+`npm audit` reports transitive advisories in two dependency chains, neither reachable by this
+application's own code:
+
+- **`multer`** (via `@nestjs/platform-express` on the NestJS 11.x line) — several DoS-class
+  advisories, fixed only by upgrading to NestJS 12. This app has no file-upload endpoints and never
+  wires up `multer`'s interceptors.
+- **`mysql2`/`deepmerge-ts`** (via `prisma`'s own `@prisma/config` dependency) — MySQL-protocol
+  advisories. This app exclusively uses `@prisma/adapter-pg`; it never connects to MySQL.
+
+`prisma` (the CLI) is intentionally a `dependencies` entry, not `devDependencies` — the Docker
+runtime image's `npm ci --omit=dev` still needs the `prisma` binary present so `prisma migrate
+deploy` can run automatically on container startup (see [Setup](#setup)). `npm audit fix --force`
+was deliberately not run: it would downgrade to `prisma@6.19.3`, a breaking change to the
+driver-adapter/`prisma-client` generator architecture this project is built on, to fix an advisory
+in code paths this app never executes.
 
 ## Assumptions / Trade-offs
 
