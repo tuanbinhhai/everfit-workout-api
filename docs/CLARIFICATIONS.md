@@ -1,5 +1,12 @@
 # Clarifications & Assumptions — Workout Logging API
 
+> **Historical planning document.** Written during Phase 2, before implementation. The
+> assumptions recorded here were carried into the implemented system largely as written, but this
+> file is not re-verified against the final code — for the current, authoritative description of
+> what the system actually does, see [`README.md`](../README.md) and (for design rationale)
+> [`docs/ARCHITECTURE.md`](ARCHITECTURE.md). Kept here as evidence of the planning process, per
+> this project's documentation policy of not rewriting history.
+
 The assignment does not fully specify every behavior. Rather than block on these, each item below
 records the question, why it matters, the options considered, and the **recommended assumption**
 that implementation will proceed with. All assumptions are chosen to be simple, defensible, and

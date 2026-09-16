@@ -1,5 +1,12 @@
 # Implementation Plan — Workout Logging API
 
+> **Historical planning document.** Written during Phase 4, before implementation, as a
+> step-by-step execution plan. Steps 0–13 were carried out largely as planned (see `AI_WORKFLOW.md`
+> for the real chronology, including the few places implementation diverged — e.g. Step 8 used
+> Prisma's query builder instead of raw SQL, Step 4's unit conversion is a flat factor table
+> instead of per-unit classes). This file is not rewritten to match the final implementation; for
+> the current, authoritative description of the system, see [`README.md`](../README.md).
+
 Builds directly on `docs/ARCHITECTURE.md` (approved). Each step below is a small, independently
 reviewable vertical slice: it should leave the repo in a working, tested state, and map to one
 (or occasionally two closely related) git commit(s). No step depends on a later step's decisions.

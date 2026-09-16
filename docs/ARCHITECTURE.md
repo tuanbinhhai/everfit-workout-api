@@ -185,11 +185,23 @@ data.
 At the assignment's stated scale (50,000 entries/user, ≤10 sets/entry), even a worst case where
 one exercise absorbs most of a user's history stays in the tens-of-thousands-of-rows range for a
 single index-scoped scan plus an in-memory `ROW_NUMBER()` sort — acceptable for the initial
-target, but a claim to be **verified with `EXPLAIN ANALYZE`** against seeded worst-case data
-during the Phase 9 performance review, not assumed correct here. If profiling identifies this as
-an actual hot path (e.g., a user with tens of thousands of entries on one exercise and frequent
-PR reads), a precomputed/materialized PR read-model (§5.4) is the documented future optimization —
-not built now, since it's unjustified without a measured bottleneck.
+target.
+
+**Verified (Step 12), not just assumed.** A real 50,000-entry dataset was seeded with a
+deliberate worst-case 40% single-exercise concentration (20,000 entries / ~80,000 candidate sets
+for one exercise), and the query above was run under real `EXPLAIN (ANALYZE, BUFFERS)`. Result:
+**~156ms**, dominated by three sorts (one per metric) over the ~80,000-row candidate set, with the
+`Seq Scan`/`Bitmap Index Scan` portion that locates the candidates taking only a few milliseconds
+of that total — confirming cost scales with candidate-set size, exactly as predicted above, not
+O(1) and not a fixed cost regardless of concentration. A range-bounded query over the same
+worst-case exercise (30-day window, ~1,680 candidate sets) completed in **~2.15ms**, entirely
+in-memory (no disk spill), directly demonstrating the scaling relationship. Full evidence:
+`docs/PERFORMANCE_NOTES.md` §10–§11. No query/schema change was made — 156ms for a deliberately
+pathological single-exercise concentration is within acceptable bounds for an infrequent,
+single-lookup endpoint. If profiling of *real* usage ever identifies this as an actual hot path
+(e.g., a genuine user with tens of thousands of entries on one exercise and frequent PR reads), a
+precomputed/materialized PR read-model (§5.4) is the documented future optimization — not built
+now, since it's unjustified without a measured bottleneck.
 
 This scoping is still the key reason JSONB (§4.1) would have been the wrong call: JSONB would
 force scanning every entry's array on every PR query with no index support at all, whereas the
@@ -263,12 +275,24 @@ CREATE INDEX idx_entries_exercise_trgm
     ON workout_entries USING gin (exercise_name_normalized gin_trgm_ops);
 ```
 
-Filter query then does `WHERE exercise_name_normalized ILIKE '%' || $term || '%'`, matched
-against the already-lowercased `exercise_name_normalized` column (normalization done once at
-write time, not per query) — the trigram GIN index supports this substring pattern directly, and
-Postgres's planner will pick it once the table has enough rows to make a scan more expensive than
-the index (verified during the Phase 9 performance review with `EXPLAIN ANALYZE` once real data
-is seeded — noted here as a claim to verify, not assumed).
+Filter query does `WHERE exercise_name_normalized LIKE '%' || $term || '%'` (plain, case-sensitive
+`LIKE`, not `ILIKE` — sufficient because `exercise_name_normalized` is already lowercased at write
+time, so no case-insensitive operator is needed at query time), matched against the
+already-lowercased `exercise_name_normalized` column. The implementation (`WorkoutsRepository`,
+Step 8) builds this via Prisma's query builder (`contains`), not hand-written raw SQL — Prisma's
+generated `LIKE`-based query turned out sufficient without a concrete benefit from raw SQL here.
+
+**Verified (Step 12), not assumed: the trigram index is not always the one actually used.**
+Running the substring-search query under real `EXPLAIN (ANALYZE, BUFFERS)` against the seeded
+50,000-entry dataset showed PostgreSQL's planner did **not** pick `idx_entries_exercise_trgm` for
+this query shape — it preferred `idx_entries_user_date` (scoped by `user_id`) with the substring
+match applied as a cheap `Filter`, because the `user_id` equality scope combined with `LIMIT 20`
+made that plan cheaper than a GIN bitmap scan across a larger cross-user match set. The trigram
+index **is** genuinely used, but for a different query: the personal-records repository's
+exact-match candidate lookup (§5.3), where `gin_trgm_ops` supports the `=` operator directly, not
+only `LIKE`/`ILIKE`. Both are real, checked planner decisions — see `docs/PERFORMANCE_NOTES.md`
+§7 and §10. The index is not dead weight, but "it exists" is not the same claim as "it's used for
+substring search at every data shape," and this document should not imply the latter.
 
 ---
 
@@ -278,7 +302,7 @@ is seeded — noted here as a claim to verify, not assumed).
 |---|---|---|
 | History list for a user, default order, paginated | `idx_entries_user_date ON workout_entries (user_id, date DESC, id DESC)` | Also the base index cursor pagination keys off (§8) |
 | History filtered by exercise (+ optionally date range) | `idx_entries_user_exercise_date ON workout_entries (user_id, exercise_name_normalized, date DESC, id DESC)` | Same index serves PR queries' scoping join (§5.2) |
-| Partial exercise-name search | `idx_entries_exercise_trgm` (GIN, trigram) — §6 | Only needed when `exerciseName` filter is a substring, not exact |
+| Partial exercise-name search | `idx_entries_exercise_trgm` (GIN, trigram) — §6 | Design intent: substring search. **Measured (Step 12): not actually selected for this query shape at 50k rows/user** — the planner prefers `idx_entries_user_date` + filter instead; the trigram index is measured in use for the PR query's exact-match lookup. See §6. |
 | Muscle-group filter | Join to `exercise_muscle_groups` on its `PRIMARY KEY (exercise_name_normalized)` | Mapping table is small (hundreds of rows) — no extra index needed beyond its PK; the join is driven by whichever entry index the other filters already selected |
 | Set lookup for an entry (history response assembly, PR join) | `idx_sets_entry ON workout_sets (workout_entry_id)` | Also serves as the FK's supporting index (Postgres does not auto-create one) |
 | PR ranking within scoped sets | No separate index — ranking happens over the row set returned by `idx_entries_user_exercise_date` (§5.2), which is bounded to the user+exercise but not guaranteed small | Adding expression indexes on `(reps*weight_kg)` etc. is a **future** optimization if profiling (`EXPLAIN ANALYZE`, §5.2) identifies a specific exercise as disproportionately hot (§10) |
@@ -334,13 +358,26 @@ LIMIT $2;
 
 `id` (an auto-incrementing `BIGSERIAL`) is the tie-breaker because `date` alone is not unique —
 many entries can share a date. Without a deterministic tie-breaker, keyset pagination can skip or
-repeat rows that share the boundary date. The cursor is opaque to the client: base64-encoded
-JSON `{"date":"2026-09-10","id":48213}`, returned as `nextCursor` and echoed back on the next
-request; `nextCursor: null` signals the last page. Note that a **partial-match** exercise filter
-(`ILIKE '%term%'`, §6) does not benefit from either B-tree index's `exercise_name_normalized`
-column ordering and instead relies on the trigram GIN index — in that case the `(date, id)`
-keyset comparison still applies for ordering/pagination, but the initial row selection is driven
-by the trigram index rather than `idx_entries_user_exercise_date`.
+repeat rows that share the boundary date. The cursor is opaque to the client: base64url-encoded
+JSON `{"date":"2026-09-10","id":"48213"}` (see `src/workouts/cursor.ts`), returned as `nextCursor`
+and echoed back on the next request; `nextCursor: null` signals the last page.
+
+**Measured (Step 12), corrected from the original assumption below:** a **partial-match**
+exercise filter (Prisma `contains`, §6) does **not**, in practice, rely on the trigram GIN index
+for row selection — see §6's corrected note. It uses the same `idx_entries_user_date` index as the
+base case, applying the substring match as a `Filter`. The `(date, id)` keyset comparison applies
+identically regardless of which filters are active.
+
+**Measured (Step 12): keyset pagination cost is not perfectly flat with depth in this
+implementation.** The current cursor predicate is expressed as an `OR` (`date < $cursor OR (date =
+$cursor AND id < $cursorId)`), which PostgreSQL applies as a `Filter` on top of an index range
+scan rather than folding into a single index-seek condition. Measured at ~25,000 rows into a
+50,000-row single-user history: ~2.858ms, having scanned/filtered through all 25,001 preceding
+rows via the index (in order) to reach the cursor position — cost proportional to cursor depth,
+not O(1), though still fast at this scale. A row-value comparison predicate
+(`(date, id) < ($cursorDate, $cursorId)`) might let Postgres fold the bound into the index
+condition directly; this was not implemented, since no measurement showed the current ~3ms cost to
+be an actual problem at the target scale (see `docs/PERFORMANCE_NOTES.md` §6).
 
 ---
 
@@ -376,6 +413,13 @@ in place) — noted as a design constraint to revisit if that's ever added (see 
 concurrent submissions are treated as legitimate independent data, not an error condition — so no
 `UNIQUE (user_id, exercise_name, date, ...)` constraint is added that would reject them.
 
+**Response shape (implemented, not specified in the original plan):** `POST /workouts` returns
+`{ entries: [...] }`, one object per created entry (`id`, `userId`, `exerciseName`, `date`,
+`sets`), each set carrying both the as-entered `weight`/`unit` and the computed `weightKg` — the
+full write path round-trips through the same DB-generated ids and canonical values a subsequent
+`GET /workouts` read would show. See the README's [API Documentation](../README.md#api-documentation)
+section for a real, verified example.
+
 ---
 
 ## 10. Necessary now (50k entries/user) vs. future scaling
@@ -394,8 +438,10 @@ take-home beyond what it asks for.
 - Batched multi-row inserts for bulk writes (§9).
 - Connection pooling (Prisma's built-in pool / `pgbouncer` in front of Postgres if the container
   count grows) — sized via config, not hardcoded.
-- `EXPLAIN ANALYZE` verification of the above once real data is seeded (Phase 9 performance
-  review, after implementation — not claimed as done here).
+- `EXPLAIN ANALYZE` verification of the above against a real 50,000-entry seeded dataset —
+  **done** (Step 12); see `docs/PERFORMANCE_NOTES.md` for full evidence and §5.2/§6 above for the
+  two corrections it produced (PR-query cost model confirmed as predicted; trigram-index-use claim
+  narrowed to what's actually measured).
 
 **Future, at much larger scale (e.g., 10,000 concurrent coaches, documented but not built):**
 - **Read replicas** for history/PR reads, keeping the primary focused on writes.
@@ -441,18 +487,36 @@ Satisfies "should be configurable (not hardcoded in business logic)" directly, n
 
 ## 12. Unit conversion abstraction
 
-Satisfies "adding a new unit type (e.g. stone) should require minimal code changes":
+Satisfies "adding a new unit type (e.g. stone) should require minimal code changes".
 
-- A `UnitConverter` interface: `toKg(value: number): number` / `fromKg(kg: number): number`.
-- A small registry/map keyed by unit string (`'kg' → IdentityConverter`, `'lb' → PoundConverter`),
-  injected as a single `UnitConversionService` used by both the write path (computing
-  `weight_kg` at creation) and the read path (converting stored `weight_kg` to the caller's
-  requested display unit).
-- Adding `stone` means: one new class implementing `UnitConverter`, one registry entry, one
-  addition to the DTO's allowed-unit enum/validator. No service, controller, or query code
-  changes — the registry is the single seam.
-- Unsupported units are rejected by the DTO validator before reaching the service layer
-  (structured 400, per Clarifications #18).
+**As implemented** (simpler than the original per-unit-class design below, and deliberately kept
+that way — see the note at the end of this section): a single `UnitConversionService`
+(`src/unit-conversion/unit-conversion.service.ts`) holds one flat conversion-factor table:
+
+```ts
+const KG_PER_UNIT: Record<string, number> = {
+  kg: 1,
+  lb: 0.45359237,
+};
+```
+
+`toKg(value, unit)` multiplies by the factor, `fromKg(valueKg, unit)` divides by it,
+`isSupported(unit)` is a key-existence check. Both the write path (computing `weightKg` at
+creation) and the read path (converting stored `weightKg` to a caller's requested display unit)
+depend on this one injectable service. Adding `stone` means: one new entry in `KG_PER_UNIT`
+(`stone: 6.35029318`) — no new class, no registry wiring, no service/controller/query change.
+Unsupported units throw a typed `UnsupportedUnitError`, mapped by `GlobalExceptionFilter` to a
+structured `400` before reaching any query.
+
+**Deviation from the original plan, deliberate:** the pre-implementation architecture draft
+described a `UnitConverter` interface with one class per unit (`IdentityConverter`,
+`PoundConverter`, ...). Implementation replaced this with the flat factor table above — every unit
+supported so far (`kg`, `lb`, and any realistic future unit like `stone`) is a pure linear scale
+of kg, so a per-unit *class* adds indirection (a whole `UnitConverter` implementation, a DI
+registration) without adding any capability a `number` in a `Record` doesn't already provide. The
+per-class design would only earn its complexity back for a genuinely non-linear conversion (none
+exist for weight), so it was not built speculatively. This is the single seam either way: the one
+place a new unit is added.
 
 ---
 
@@ -467,11 +531,14 @@ AppModule
 ├── ExerciseMetadataModule
 │   └── MuscleGroupProvider (interface) + PrismaMuscleGroupProvider (implementation — §11)
 ├── WorkoutModule
-│   ├── WorkoutsController        (POST /workouts, GET /workouts)
-│   ├── PersonalRecordsController (GET /workouts/prs, GET /workouts/prs/compare)
+│   ├── WorkoutsController        (POST /workouts, GET /workouts, GET /workouts/prs,
+│   │                              GET /workouts/prs/compare — one controller, not split; kept
+│   │                              together since all four routes share the "/workouts" resource
+│   │                              and splitting proved unnecessary during implementation)
 │   ├── WorkoutsService           (validation orchestration, delegates conversion + persistence)
 │   ├── PersonalRecordsService    (PR query orchestration, delegates to repository — §5)
-│   └── WorkoutsRepository        (Prisma client calls + raw SQL for pagination/PR/search — §5, §6, §8)
+│   ├── WorkoutsRepository        (Prisma query-builder calls for creation/history — §8)
+│   └── PersonalRecordsRepository (raw SQL, windowed PR ranking query — §5)
 └── Common
     ├── DTOs (class-validator) — CreateWorkoutEntryDto, BulkCreateWorkoutDto, HistoryQueryDto, PrQueryDto, PrCompareQueryDto
     ├── GlobalExceptionFilter (structured error envelope — Clarifications #18)
@@ -494,8 +561,19 @@ separate code path or separate concurrency behavior.
 
 ## Open items carried forward
 
-- §5.4 and §10 precomputed-PR/caching are explicitly deferred — will be revisited only if the
-  Phase 9 performance review (post-implementation, with real `EXPLAIN ANALYZE` output) shows the
-  on-the-fly query underperforming, not before.
-- Trigram index performance (§6) is a claim to verify with real seeded data during Phase 9, not
-  assumed here.
+- §5.4 and §10 precomputed-PR/caching remain explicitly deferred — Step 12's real
+  `EXPLAIN ANALYZE` evidence (worst-case ~156ms for a 20,000-entry single-exercise concentration)
+  does not show the on-the-fly query underperforming, so this stays a documented future option,
+  not something to build now.
+- Trigram index performance (§6) has been **verified** with real seeded data (Step 12) — resolved,
+  not still open. The specific finding (not used for substring search at this data shape, used
+  instead for the PR query's exact-match lookup) is recorded in §6 and
+  `docs/PERFORMANCE_NOTES.md`.
+- Deep-cursor pagination cost (§8) — newly identified by Step 12's measurement (cost proportional
+  to cursor depth via a `Filter`, not a direct index seek) — is a documented characteristic, not
+  yet a problem at the measured scale (~2.858ms at 25,000 rows deep). Left open as a candidate for
+  a row-value-comparison rewrite if future measurement at larger scale shows it's needed.
+
+This document is kept synchronized with the implemented system as of Step 13 (documentation
+finalization) — see `AI_WORKFLOW.md` for the full chronology of what changed between this plan and
+the final implementation, and `README.md` for the reviewer-facing summary.
