@@ -64,6 +64,7 @@ correction happens inline, in conversation, before code is accepted.
 | 13 | Step 8 — GET /workouts history + cursor pagination | Explicit instruction to prefer Prisma's query builder over raw SQL unless there's a concrete benefit, even though ARCHITECTURE.md originally framed these same queries around raw SQL | `contains`/`mode:'insensitive'` for trigram-backed substring search, an `OR`-based keyset predicate for `(date,id) < (cursor.date,cursor.id)`, a second small query to resolve muscleGroup → exercise names (no raw SQL, no schema relation added) | Matched the requested shape; caught two real issues via actual execution, not code review — see "AI mistakes" below | Committed (`859cd5c`); 77 unit / 24 integration / 43 e2e, Docker-verified with real curl + psql incl. real cursor-based pagination |
 | 14 | Step 9 — GET /workouts/prs personal records | Explicit instruction that raw SQL is justified here (unlike Step 8) since Prisma has no `ROW_NUMBER() OVER (...)` equivalent; explicit exact-match (not partial) exercise identity requirement | One windowed `$queryRaw` tagged-template query computing and ranking all three PR metrics in a single round trip, casting NUMERIC/BIGINT columns to text to preserve precision through to JS; two small pure functions (`calculateVolume`, `calculateEpley1Rm`) mirroring the SQL's formulas, unit-tested independently; SQL ranking itself verified only via integration tests, not re-implemented in TS for unit testing | Matched the requested shape and the requested test-layer split (no duplicated ranking logic in TS just to unit-test it) | Committed (`8b18b7d`); 92 unit / 34 integration / 51 e2e, Docker-verified with real curl + psql cross-checking the DB's own raw metric computation against the API's selected winners |
 | 15 | Step 10 — GET /workouts/prs/compare range comparison | Explicit instruction to reuse Step 9's ranking logic via an optional range parameter, not duplicate it; explicit two-independent-queries design (not one range-bucketed query); explicit canonical-kg-before-rounding delta semantics | Extended `findCandidates` with an additive optional `range` param (`Prisma.sql`/`Prisma.empty` conditional fragment in the same query), extracted `computeWinnersAndMetrics()` out of the existing Step 9 method so both single-range and two-range call sites share it, `Promise.all` for the two independent range queries, delta computed from raw canonical metrics carried alongside the already-existing display records | Matched the requested shape and reuse strategy exactly; the Step 9 method WAS refactored (extracted, not rewritten) specifically because Step 10 revealed the concrete duplication the instructions anticipated — verified Step 9's own test suite still passes unmodified, confirming no behavior change | Committed (`50e730b`); 103 unit / 44 integration / 62 e2e, Docker-verified incl. explicit regression curl checks of all three prior endpoints before testing the new one, plus a delta manually cross-checked against the same Epley arithmetic run directly via psql |
+| 16 | Step 11 — structured request logging | Explicit library preference (nestjs-pino/pino-http unless a concrete reason not to), explicit field/sensitivity constraints | Read nestjs-pino's actual README/type definitions before writing any code (not assumed from training knowledge) — this is what surfaced the Node >=22.12 requirement and the exact `genReqId`/serializer API shape; custom req/res serializers reduced to `{id, method, url}`/`{statusCode}` only | Matched the requested design; caught and fixed a real gap myself before it reached commit — see "AI mistakes" below | Committed (`a043d03`); 112 unit / 44 integration / 64 e2e, Docker rebuilt on the now-required Node 22 base image and manually verified incl. a real DB-outage-triggered 500 (not a fake endpoint) |
 
 ---
 
@@ -262,6 +263,44 @@ files is a parallelism hazard by default, not just when a test explicitly looks 
 needs to be structural (serialize the suite) rather than per-test, or every future spec file
 author has to remember an isolation convention nothing enforces.
 
+### 7. Custom pino-http request serializer silently dropped the request id from logs
+
+**Original AI output (Step 11 `pino-http-options.ts`, first draft):** A custom `req` serializer
+was written to strip everything down to `{ method, url }` — deliberately minimal, so no headers,
+query params, or bodies would ever be logged. It compiled, passed lint, and passed the unit tests
+I had written for it (which only checked that `method`/`url` were present and `headers` was not).
+
+**Why it was wrong:** pino-http's *default* request serializer includes `req.id` (bound from
+`genReqId`) alongside method/url/headers/etc. By replacing the whole serializer instead of
+extending it, I also replaced away the `id` field — the one piece of information the entire
+correlation-id feature exists to put into the logs. The unit tests I'd written didn't catch this
+because they only asserted what I expected to be *absent* (headers) and a couple of fields I
+expected to be *present* (method, url) — I never wrote an assertion checking for `id` specifically,
+because at the time I wrote the test I was focused on proving the sensitive-data exclusion, not on
+proving the one field the feature is actually for. The gap surfaced only when I read real e2e log
+output during the manual verification step and noticed the `req` object in the "request completed"
+log line had no `id` at all — request bodies for the response headers were fine (the `x-request-id`
+header was being set correctly, since that's independent of the serializer), but the *logs*
+themselves — the thing correlation ids are for — couldn't actually be traced back to a request id.
+
+**How it was caught:** Manual e2e log inspection (the required Step 11 verification step, not
+optional), specifically reading actual JSON log lines rather than just confirming the tests were
+green and the response header was present. The response header being correct made it easy to
+assume the logging side was also correct without looking.
+
+**Correction:** Added `id: req.id` to the custom serializer's output, with a comment explaining
+that a custom serializer replaces pino-http's default entirely rather than extending it — a
+non-obvious behavior that's easy to get wrong in exactly this way. Updated the existing serializer
+unit test to assert `id` is present in the serialized shape (not just that `method`/`url` are
+present and `headers` is absent), so this specific regression can't reoccur silently. Reran the
+e2e suite and manually reconfirmed `req.id` appears in real log output afterward.
+
+**What was learned:** Testing "what should be excluded" and "what should be included" are
+separate concerns, and a test suite that only checks one can pass green while completely missing
+the other — the unit test proved the sensitive-data guarantee but said nothing about whether the
+feature's actual purpose (correlation) worked. Reading real log output, not just trusting green
+tests, is what caught this.
+
 ### Minor, for completeness: a wrong test expectation (not application code), caught by actually running it
 
 Not counted as one of the two required examples above (those are substantive; this is a one-line
@@ -416,6 +455,23 @@ What was personally verified in this session, not just generated and trusted:
   hand (Python), separately ran the identical Epley arithmetic directly via `psql` against the
   same rows, and confirmed both matched the API's actual response — three independent
   computations of the same number, not one code path checked against itself.
+- **Library requirements checked by reading actual docs, not assumed**: before writing any
+  logging code, read nestjs-pino's real README/compatibility table, which is what surfaced the
+  Node >=22.12 requirement (our Dockerfile was on `node:20-slim`) and the exact `genReqId`/
+  serializer API shape (including the "don't re-import LoggerModule into a feature module" pitfall
+  the library's own docs warn causes silent double-logging) — none of this was guessed from
+  training-time familiarity with an older nestjs-pino API.
+- **A real, uncomfortable failure mode manually triggered on purpose**: stopped the Postgres
+  container while the API was still running and issued a real request against it, specifically to
+  observe genuine unexpected-500 logging behavior — rather than trusting the unit tests' mocked
+  500 scenario as sufficient proof for what happens with an actual unhandled `PrismaClientKnownRequestError`
+  in production-like conditions. This is also what confirmed `app.useLogger()` really does route the
+  existing `GlobalExceptionFilter`'s logging through pino, rather than assuming the framework
+  mechanics described in nestjs-pino's docs apply the way documented.
+- **Log output read line-by-line, not just checked for "no error thrown"**: mistake #7 (missing
+  `req.id` in logs) was only found by actually reading real JSON log lines during manual
+  verification — the automated test suite was green throughout because it never asserted on the
+  one field that mattered.
 
 This section will keep growing as later implementation steps land.
 
@@ -425,7 +481,7 @@ This section will keep growing as later implementation steps land.
 
 **Date / session:** 2026-09-15/16. Session 1 (09-15): Phases 1–4 planning + Steps 0–2.
 Session 2 (09-15, continuation): Steps 3–4. Session 3 (09-15, continuation): Steps 5–7 + end-of-day
-closeout. Session 4 (09-16): context restored and re-verified, then Steps 8–10.
+closeout. Session 4 (09-16): context restored and re-verified, then Steps 8–11.
 
 **Completed implementation steps** (of `docs/IMPLEMENTATION_PLAN.md`'s 15 steps):
 - Step 0 — NestJS bootstrap + tooling. Commit `4bb235b`.
@@ -440,64 +496,69 @@ closeout. Session 4 (09-16): context restored and re-verified, then Steps 8–10
   `859cd5c`.
 - Step 9 — `GET /workouts/prs`: heaviest set, highest-volume set, best estimated 1RM, each with
   achievement date, via one windowed `$queryRaw` query. Commit `8b18b7d`.
-- Step 10 — `GET /workouts/prs/compare`: two caller-supplied date ranges (no auto-inferred
-  "this month vs last"), each independently validated, each reusing Step 9's exact ranking logic
-  via an additive optional `range` param on `findCandidates` (`Prisma.sql`/`Prisma.empty`
-  conditional fragment in the same query — no second query implementation). Delta (absolute +
-  percentage) computed from canonical kg-space metrics before any display rounding; missing data
-  on either side produces null deltas (never zero); `previousKg === 0` produces a null percentage
-  specifically while the absolute delta is still computed (never Infinity/NaN). Step 9's own
-  method was refactored (extracted into a shared `computeWinnersAndMetrics()`, not rewritten) to
-  eliminate the duplication Step 10 would otherwise have required — verified via Step 9's full
-  test suite passing unmodified. Commit `50e730b`.
+- Step 10 — `GET /workouts/prs/compare`: two caller-supplied date ranges, reusing Step 9's exact
+  ranking logic. Commit `50e730b`.
+- Step 11 — Structured request logging: `nestjs-pino`/`pino-http` replace Nest's console logger
+  everywhere (app startup, existing `Logger` calls, and one automatic per-request completion log
+  with method/url/statusCode/responseTime/request-id). Request id reuses a client-supplied
+  `x-request-id` header when present, otherwise generates one, echoed back as a response header.
+  Custom req/res serializers emit only `{id, method, url}`/`{statusCode}` — never headers, query
+  params, or bodies. `GlobalExceptionFilter` needed no code changes: `app.useLogger()` routes its
+  existing `Logger` calls through pino automatically. Required bumping the Dockerfile's Node base
+  image from 20 to 22 (nestjs-pino v5 requires >=22.12 — discovered by reading the library's own
+  docs before installing, not assumed). Commit `a043d03`.
 
 Plus Phase 1–4 planning docs (`b673004`) and the `AI_WORKFLOW.md` handoff updates (`eb6e761`,
-`344d989`, `0f2ef49`, `d110c96`, `0e46962`, `073b44c`, `613589f`).
+`344d989`, `0f2ef49`, `d110c96`, `0e46962`, `073b44c`, `613589f`, `e7b8888`).
 
-**Current implementation state:** Steps 0–10 fully implemented and verified for real. Steps 11–14
-(structured logging, 50k-entry seed + `EXPLAIN ANALYZE` performance verification, README, final
-adversarial self-review) have **not** been started.
+**Current implementation state:** Steps 0–11 fully implemented and verified for real. Steps 12–14
+(50k-entry seed + `EXPLAIN ANALYZE` performance verification, README, final adversarial
+self-review) have **not** been started.
 
 **Tests currently passing/failing:**
-- Unit (`npm test`): **103/103 passing** — adds 11 new `comparePersonalRecords` cases (positive/
-  negative/zero delta, current/previous/both missing, previous-metric-zero → null percentage but
-  computed absolute, kg/lb output, percentage's unit-independence, correct independently-inclusive
-  range predicates passed to the repository, unsupported unit skips the repository). All of
-  Step 9's existing tests pass unmodified, confirming the shared-logic extraction changed nothing
-  observable.
-- Integration (`npm run test:integration`, real Postgres, `--runInBand`): **44/44 passing** — adds
-  10 new range-scoped `findCandidates` tests (distinct winners per range, inclusive boundaries,
-  overlapping ranges, mixed kg/lb within a range, tie-breaking within a range, user/exercise
-  isolation within a range, one/both empty ranges, full NUMERIC(10,4) precision within a range).
-- E2E (`npm run test:e2e`, real Postgres, `--runInBand`): **62/62 passing** — adds 11 new
-  `GET /workouts/prs/compare` public-contract tests.
+- Unit (`npm test`): **112/112 passing** — adds 9 new logging tests: `resolveRequestId` (reuse a
+  supplied header, generate when absent/empty/whitespace, first-value-of-array, uniqueness across
+  calls) and `createPinoHttpOptions` (log level from config, `genReqId` reuse+response-header
+  behavior, serializers expose `id`/`method`/`url`/`statusCode` and nothing else — including `id`,
+  added after mistake #7 below was fixed).
+- Integration (`npm run test:integration`, real Postgres, `--runInBand`): **44/44 passing**,
+  unchanged (logging is an HTTP-layer/bootstrap concern, not exercised by these repository-level
+  tests).
+- E2E (`npm run test:e2e`, real Postgres, `--runInBand`): **64/64 passing** — adds 2 new focused
+  request-id contract tests (generates+returns one when absent, reuses a client-supplied one) to
+  the existing health e2e file, without duplicating any per-endpoint API test.
 
 **Build/lint/format status:**
 - `npm run build`: clean, `dist/main.js` at the correct path.
 - `npm run lint`: 0 errors, 0 warnings.
 - `npx prettier --check`: clean.
 
-**Docker status:** Rebuilt and manually verified end-to-end this checkpoint, **including an
-explicit regression pass**: re-curled `GET /health`, `POST /workouts`, `GET /workouts`, and
-`GET /workouts/prs` against the rebuilt container *before* testing the new comparison endpoint,
-per the checkpoint's explicit requirement. All 10 comparison-specific checklist items verified
-via real `curl` (both-with-data, distinct-metric winners, positive delta, negative delta, lb
-conversion, current-empty, previous-empty, both-empty, overlapping ranges, invalid range → 400).
-One delta (`best1Rm` for real seeded data) cross-checked three ways: the API's response, a
-by-hand Python computation, and the identical Epley arithmetic run directly via `psql` — all three
-matched exactly. Stack torn down (`docker compose down`) at the end; volume preserved.
+**Docker status:** Rebuilt on the new `node:22-slim` base (required, not optional — the build
+itself proves the Node bump works) and manually verified: `GET /health` (200, `x-request-id`
+header present, structured JSON logs), valid `POST /workouts`, a validation 400, and a malformed-
+cursor 400 — all logged at info level with method/url/statusCode/responseTime/request-id, never as
+errors. A **real** unexpected 500 was triggered by stopping the Postgres container mid-request
+(not a throwaway test endpoint): client got a clean generic 500 with zero leaked internals, while
+the server log carried the full `PrismaClientKnownRequestError` stack, correlated by request id
+with pino-http's own per-request outcome log. Postgres was restarted and recovery confirmed, then
+all four existing endpoints (`POST /workouts`, `GET /workouts`, `GET /workouts/prs`,
+`GET /workouts/prs/compare`) regression-checked — no response-contract changes. Stack torn down
+(`docker compose down`) at the end; volume preserved.
 
 **Database status:** Same Postgres volume as previous checkpoints, now also containing this
-checkpoint's manual-verification data (`compare-user`) — harmless, dev-only, left in place.
+checkpoint's manual-verification data (`log-user`) — harmless, dev-only, left in place.
 
-**Latest commit:** `50e730b` — `feat: add personal record range comparison` (this
-`AI_WORKFLOW.md` update will be its own commit immediately after being written).
+**Latest commit:** `a043d03` — `chore: add structured request logging` (this `AI_WORKFLOW.md`
+update will be its own commit immediately after being written).
 
 **Working tree status:** Clean prior to this update, verified via `git status` before committing.
 
 **Known issues:** Unchanged from the last checkpoint (transitive `npm audit` advisories in
 unreachable code paths; host port 5432→5433 remap; `--runInBand` on the integration/e2e npm
-scripts — all permanent and documented). Nothing new introduced by Step 10.
+scripts) **plus one new, permanent, evidence-based change**: the Docker base image and
+`package.json` `engines` field now require Node >=22 (was >=20) — not a regression, a real
+requirement of the logging library actually installed, to be called out explicitly in the README
+so it isn't mistaken for an arbitrary version bump.
 
 **Unresolved decisions:** None blocking.
 
@@ -514,22 +575,24 @@ rejection occurred this checkpoint; none was invented.
    raw-SQL framing for trigram search and keyset pagination — to reconcile at the README step.
 4. (Carried forward, not really a deviation) Step 9's raw-SQL PR query matches `ARCHITECTURE.md`
    §5.3 closely — the step where raw SQL turned out correct and necessary, the mirror image of #3.
-5. (New) `ARCHITECTURE.md` §1 sketches `GET /workouts/prs/compare` as the comparison route, which
-   is exactly what was implemented — not a deviation, noted only to confirm the route naming from
-   planning survived unchanged through to implementation, worth stating explicitly at the README
-   step alongside where other routes *did* end up differing from early sketches.
+5. (Carried forward, not really a deviation) Step 10's route matches `ARCHITECTURE.md` §1's
+   original sketch exactly.
+6. (New) Node runtime requirement bumped from >=20 to >=22.12, and the Dockerfile's base image
+   from `node:20-slim` to `node:22-slim` — a real, externally-imposed requirement (nestjs-pino v5),
+   not a design choice revisited; to document in the README's setup/requirements section.
 
-**Exact next implementation step:** `docs/IMPLEMENTATION_PLAN.md` **Step 11 — Structured
-logging**: wire `nestjs-pino` (or equivalent) as the Nest logger, request-id correlation, log
-level from `ConfigService`, and connect the existing `GlobalExceptionFilter`'s 500-level logging
-(currently via Nest's default `Logger`) to the same structured output. This is a cross-cutting
-production-readiness step, not new business logic — first step since Step 5 that touches
-`main.ts`/`configure-app.ts` rather than the `workouts` feature area.
+**Exact next implementation step:** `docs/IMPLEMENTATION_PLAN.md` **Step 12 — Seed script for
+scale testing + `EXPLAIN ANALYZE` verification**: generate 50,000+ `WorkoutEntry`/`WorkoutSet`
+rows for one synthetic user, including a worst-case single-exercise concentration scenario (per
+`ARCHITECTURE.md` §5.2's corrected, unverified cost model), then run and record real
+`EXPLAIN ANALYZE` output for history filtering, partial-match search, muscle-group filtering, PR
+queries (including the worst-case concentration), and pagination at depth — in
+`docs/PERFORMANCE_NOTES.md`. This is the step where every performance claim flagged as
+"unverified" throughout `ARCHITECTURE.md` since Phase 3 finally gets checked against a real query
+planner, not assumed correct from index design alone.
 
-**Files/modules likely to be touched next:** `src/common/logging/` (new), `src/main.ts` /
-`src/configure-app.ts` (wire the logger), possibly `src/common/filters/global-exception.filter.ts`
-(route its logging through the new structured logger instead of the default `Logger`), and
-`package.json` (new dependency). After Step 11, Step 12 (50k-entry seed + `EXPLAIN ANALYZE`) is
-where the performance claims flagged as unverified throughout `docs/ARCHITECTURE.md` (§5.2's
-corrected cost model, §6's trigram index usage, §8's keyset pagination) finally get checked
+**Files/modules likely to be touched next:** new `scripts/seed-scale-test.ts`, new
+`docs/PERFORMANCE_NOTES.md`, and likely corrections to `docs/ARCHITECTURE.md` itself if any claim
+turns out wrong under real `EXPLAIN ANALYZE` output — per that document's own "open items carried
+forward" note, this is expected to possibly happen, not a sign something went wrong if it does.
 against real query plans rather than remaining documented-but-unverified assumptions.
